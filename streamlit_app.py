@@ -1,5 +1,5 @@
 """
-OFX Converter for ODOO — app.py
+OFX Converter for ODOO — app.py  v4.0
 ======================================
 Auteur  : Achraf BEN YOUNES
 - Sidebar configuration supprimée (intégrée dans la page principale)
@@ -599,11 +599,56 @@ def _get_gcv_api_key() -> str:
     return st.session_state.get("gcv_api_key", "")
 
 def _rasterize_pdf_bytes_to_images(raw_bytes: bytes, dpi: int = 200) -> list:
+    """
+    Rasterise un PDF en liste d'images PIL.
+    
+    Stratégie (sans dépendance poppler) :
+    1. pypdfium2  — dépendance de pdfplumber, TOUJOURS disponible sur Streamlit Cloud
+    2. pdfplumber.to_image — fallback secondaire (utilise aussi pypdfium2 en interne)
+    3. pdf2image  — fallback final si poppler est installé sur la machine
+    
+    NE nécessite PAS poppler-utils / packages.txt.
+    """
+    # ── Méthode 1 : pypdfium2 (recommandée, sans poppler) ──────────────────
+    try:
+        import pypdfium2 as pdfium
+        doc = pdfium.PdfDocument(raw_bytes)
+        scale = dpi / 72.0
+        images = []
+        for i in range(len(doc)):
+            page = doc[i]
+            bitmap = page.render(scale=scale)
+            images.append(bitmap.to_pil().convert("RGB"))
+        if images:
+            return images
+    except Exception:
+        pass
+
+    # ── Méthode 2 : pdfplumber.to_image (fallback) ─────────────────────────
+    try:
+        from io import BytesIO as _BytesIO
+        with pdfplumber.open(_BytesIO(raw_bytes)) as pdf:
+            images = []
+            for page in pdf.pages:
+                img = page.to_image(resolution=dpi).original
+                if img is not None:
+                    images.append(img.convert("RGB"))
+            if images:
+                return images
+    except Exception:
+        pass
+
+    # ── Méthode 3 : pdf2image + poppler (si disponible) ────────────────────
     try:
         from pdf2image import convert_from_bytes
-    except ImportError:
-        raise ImportError("pdf2image manquant. Ajoutez 'pdf2image>=2.7.0' dans requirements.txt et 'poppler-utils' dans packages.txt.")
-    return convert_from_bytes(raw_bytes, dpi=dpi, fmt="JPEG")
+        return convert_from_bytes(raw_bytes, dpi=dpi, fmt="jpeg")
+    except Exception:
+        pass
+
+    raise RuntimeError(
+        "Impossible de rasteriser ce PDF. "
+        "pypdfium2, pdfplumber et pdf2image ont tous échoué."
+    )
 
 def _image_to_base64_jpeg(img, quality: int = 85) -> str:
     buf = BytesIO()
@@ -1219,7 +1264,7 @@ with col_main:
             if n_rows > MAX_ROWS_WARNING:
                 st.warning(f"⚠️ {n_rows:,} lignes — import Odoo peut être lent au-delà de 5 000 transactions.")
             if "google-vision-ocr" in method:
-                st.info("🔍 PDF traité via Google Cloud Vision (pdf2image + GCV). Vérifiez le mapping ci-dessous.")
+                st.info("🔍 PDF traité via Google Cloud Vision (pypdfium2 + GCV). Vérifiez le mapping ci-dessous.")
             with st.expander("👁️ Aperçu données brutes (15 lignes)", expanded=False):
                 st.dataframe(df_raw.head(15), use_container_width=True, height=260)
 
@@ -1240,7 +1285,7 @@ with col_main:
                     if _cur_key and st.session_state.get("raw_pdf_bytes"):
                         st.markdown('<div class="key-ok" style="margin-bottom:12px;">✓ Clé GCV disponible — prêt pour l\'OCR</div>', unsafe_allow_html=True)
                         if st.button("🔄 Relancer l'OCR avec Google Cloud Vision", use_container_width=True, key="retry_gcv_btn"):
-                            with st.spinner("🔍 pdf2image + Google Cloud Vision en cours…"):
+                            with st.spinner("🔍 Rasterisation + Google Cloud Vision en cours…"):
                                 _df_r, _meth_r = parse_pdf(BytesIO(st.session_state["raw_pdf_bytes"]), gcv_api_key=_cur_key)
                             st.session_state.df_parsed = _df_r; st.session_state.parse_method = _meth_r
                             st.session_state["last_gcv_key"] = _cur_key
@@ -1509,6 +1554,6 @@ st.markdown("""
     OFX Converter for Odoo v4.0 &nbsp;·&nbsp;
     <span style="color:var(--accent);">Développé par Achraf BEN YOUNES</span>
     &nbsp;·&nbsp; 🇫🇷 France · 🇧🇪 Belgique · 🇨🇭 Suisse · 🇹🇳 Tunisie
-    &nbsp;·&nbsp; pdf2image · Google Vision OCR
+    &nbsp;·&nbsp; pypdfium2 · Google Vision OCR
 </div>
 """, unsafe_allow_html=True)
