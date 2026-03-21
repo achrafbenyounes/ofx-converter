@@ -695,46 +695,162 @@ def _complete_short_date(date_str: str, year: str) -> str:
     return date_str.strip()
 
 def parse_qonto_gcv_text(text: str) -> pd.DataFrame:
+    """
+    Parser Qonto GCV v2 — gère les deux formats de sortie GCV :
+    
+    Format A (ancien) : date + libellé + montant sur la MÊME ligne
+      "01/06  Qonto  - 70,80 EUR"
+    
+    Format B (GCV multi-lignes, le plus courant) : chaque élément sur sa propre ligne
+      "01/06"
+      "Qonto"
+      "- 70,80 EUR"
+      "Abonnement / Frais additionnels"
+    
+    Bugs corrigés vs v1 :
+    - skip_kw ne filtre plus les libellés contenant des mots géo ("FRANCE", "PARIS"…)
+    - Détection header multi-lignes (GCV sépare "Date de valeur" / "Transactions" / "Débit" / "Crédit")
+    - Machine à états (date → label → amount → memo) pour le format multi-lignes
+    """
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    year = _infer_year_from_text(text)
+    year  = _infer_year_from_text(text)
+
+    # ── Détection de l'en-tête du tableau ──────────────────────────────────
     header_idx = None
+
+    # Priorité 1 : ligne contenant simultanément date ET transaction/débit/crédit
     for i, line in enumerate(lines):
         ll = line.lower()
-        if ("date" in ll or "valeur" in ll) and ("transaction" in ll or "débit" in ll or "debit" in ll or "crédit" in ll):
-            header_idx = i; break
-    if header_idx is None: return pd.DataFrame()
-    date_pat = re.compile(r'^(\d{1,2}/\d{2}(?:/\d{2,4})?)\s+(.*)')
+        if ("date" in ll or "valeur" in ll) and (
+            "transaction" in ll or "débit" in ll or "debit" in ll or "crédit" in ll
+        ):
+            header_idx = i
+            break
+
+    # Priorité 2 : GCV a séparé les colonnes → chercher "Date de valeur" puis "Crédit" dans les prochaines lignes
+    if header_idx is None:
+        for i, line in enumerate(lines):
+            if line.lower().strip() in ("date de valeur", "date valeur"):
+                for j in range(i + 1, min(i + 8, len(lines))):
+                    if lines[j].lower().strip() in ("crédit", "credit"):
+                        header_idx = j
+                        break
+                if header_idx is not None:
+                    break
+
+    # Priorité 3 : juste avant la première date courte DD/MM
+    if header_idx is None:
+        for i, line in enumerate(lines):
+            if re.match(r'^\d{1,2}/\d{2}$', line.strip()):
+                header_idx = max(0, i - 1)
+                break
+
+    if header_idx is None:
+        return pd.DataFrame()
+
+    # ── skip_kw : patterns PRÉCIS uniquement (pas de mots géo génériques) ──
+    skip_kw_contains = {
+        "toutes les cartes de votre compte",
+        "apple pay", "google pay",
+        "entrées", "sorties",
+        "relevés de compte", "relevé de compte",
+        "olinda sas", "qonto, une marque",
+        "autorité de contrôle",
+    }
+    skip_kw_startswith = {
+        "iban:", "bic:", "solde au", "solde de", "du 0",
+    }
+
+    def should_skip(line: str) -> bool:
+        ll = line.lower()
+        if any(kw in ll for kw in skip_kw_contains): return True
+        if any(ll.startswith(kw) for kw in skip_kw_startswith): return True
+        return False
+
+    # ── Patterns ────────────────────────────────────────────────────────────
+    date_only_pat  = re.compile(r'^(\d{1,2}/\d{2}(?:/\d{2,4})?)$')
+    date_inline_pat = re.compile(r'^(\d{1,2}/\d{2}(?:/\d{2,4})?)\s+(.*)')
     amount_pat = re.compile(r'([+\-]\s*[\d\s.,]+\s*(?:EUR|CHF|TND|USD|GBP))', re.IGNORECASE)
-    skip_kw = {"toutes les cartes","apple pay","google pay","marque de","agréé","du 0",
-               "iban:","bic:","solde au","solde de","entrées","sorties","relevé","relevés",
-               "sas ","rue ","paris","france","belgium","suisse","tunisie","bruxelles"}
+
     transactions = []
     current = None
+    state = "date"  # date → label → amount → memo
+
     for line in lines[header_idx + 1:]:
-        ll = line.lower()
-        if any(kw in ll for kw in skip_kw):
-            if current: transactions.append(current); current = None
+        if should_skip(line):
+            if current and current.get("amount_str"):
+                transactions.append(current)
+            current = None
+            state = "date"
             continue
-        m_date = date_pat.match(line)
-        if m_date:
-            if current: transactions.append(current)
-            date_raw = _complete_short_date(m_date.group(1), year)
-            rest = m_date.group(2).strip()
+
+        # ── Cas : date seule sur sa ligne (format GCV multi-lignes) ────────
+        m_only = date_only_pat.match(line)
+        if m_only:
+            if current and current.get("amount_str"):
+                transactions.append(current)
+            current = {
+                "date": _complete_short_date(m_only.group(1), year),
+                "label": "", "amount_str": "", "memo_parts": []
+            }
+            state = "label"
+            continue
+
+        # ── Cas : date + texte sur la même ligne (format ancien) ───────────
+        m_inline = date_inline_pat.match(line)
+        if m_inline:
+            if current and current.get("amount_str"):
+                transactions.append(current)
+            date_raw = _complete_short_date(m_inline.group(1), year)
+            rest = m_inline.group(2).strip()
             m_amt = amount_pat.search(rest)
             amount_s = m_amt.group(1).strip() if m_amt else ""
             label = rest[:m_amt.start()].strip() if m_amt else rest
             current = {"date": date_raw, "label": label, "amount_str": amount_s, "memo_parts": []}
-        elif current:
-            m_amt = amount_pat.search(line)
-            if m_amt and not current["amount_str"]: current["amount_str"] = m_amt.group(1).strip()
-            elif line and not m_amt: current["memo_parts"].append(line)
-    if current: transactions.append(current)
-    if not transactions: return pd.DataFrame()
+            state = "memo" if amount_s else ("amount" if label else "label")
+            continue
+
+        if current is None:
+            continue
+
+        # ── Ligne avec montant ──────────────────────────────────────────────
+        m_amt = amount_pat.search(line)
+        if m_amt:
+            if not current["amount_str"]:
+                current["amount_str"] = m_amt.group(1).strip()
+                before = line[:m_amt.start()].strip()
+                if before and not current["label"]:
+                    current["label"] = before
+                state = "memo"
+            else:
+                current["memo_parts"].append(line)
+            continue
+
+        # ── Ligne texte pure ────────────────────────────────────────────────
+        if state == "label" and not current["label"]:
+            current["label"] = line
+            state = "amount"
+        elif current.get("amount_str"):
+            current["memo_parts"].append(line)
+        elif not current["label"]:
+            current["label"] = line
+            state = "amount"
+
+    if current and current.get("amount_str"):
+        transactions.append(current)
+
+    if not transactions:
+        return pd.DataFrame()
+
     rows = []
     for t in transactions:
         memo = " | ".join(t["memo_parts"]) if t["memo_parts"] else t["label"]
-        rows.append({"date": t["date"], "libellé": t["label"] or (t["memo_parts"][0] if t["memo_parts"] else ""),
-                     "montant": t["amount_str"], "memo": memo})
+        rows.append({
+            "date":    t["date"],
+            "libellé": t["label"] or (t["memo_parts"][0] if t["memo_parts"] else ""),
+            "montant": t["amount_str"],
+            "memo":    memo,
+        })
     return pd.DataFrame(rows)
 
 def _is_qonto_format(text: str) -> bool:
