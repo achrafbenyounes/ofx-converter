@@ -1,20 +1,11 @@
 """
-OFX Converter for ODOO — app.py  v3.2
+OFX Converter for ODOO — app.py
 ======================================
 Auteur  : Achraf BEN YOUNES
-Version : 3.2.0
-
-CORRECTIF v3.2 vs v3.1 :
-─────────────────────────
-[FIX-PDF-VECTOR] Remplacement de _rasterize_pdf_page (pdfplumber.to_image)
-                 par pdf2image (pdftoppm) dans la Passe 6 GCV.
-                 pdfplumber.to_image dépend de wand/ghostscript sur certaines
-                 config Streamlit Cloud → silencieusement None → GCV jamais appelé.
-                 pdf2image (poppler-utils) est TOUJOURS disponible sur Streamlit Cloud.
-[FIX-RETRY]     Le bouton "Relancer l'OCR" utilise aussi pdf2image, pas pdfplumber.
-[FIX-SECRETS]   _get_gcv_api_key() lit st.secrets EN PREMIER, avec fallback session.
-[REQUIRE]       Ajouter dans requirements.txt : pdf2image>=2.7.0
-[PACKAGES]      Ajouter packages.txt à la racine : poppler-utils
+- Sidebar configuration supprimée (intégrée dans la page principale)
+- Nouveau design clair, moderne et attractif
+- Banques étendues : France, Belgique, Suisse, Tunisie
+- pdf2image + GCV pour PDF vectoriels
 """
 
 import hashlib
@@ -36,98 +27,372 @@ try:
 except ImportError:
     HAS_TESSERACT = False
 
-# ─── Page Config ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="OFX Converter — Odoo",
     page_icon="💳",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-# ─── Custom CSS ───────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Bricolage+Grotesque:wght@300;400;500;600;700;800&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Sora:wght@300;400;500;600;700;800&display=swap');
+
 :root {
-    --bg:#05070d;--surface:#0c0f1a;--card:#101420;--card2:#141826;
-    --border:#1c2235;--border2:#243050;--accent:#4f8ef7;--accent2:#00d4aa;
-    --accent3:#f97316;--success:#22c55e;--warning:#eab308;--danger:#ef4444;
-    --text:#e2e8f8;--muted:#5a6580;--muted2:#8896b0;--glow:rgba(79,142,247,0.15);
+    --bg:        #f0f4ff;
+    --bg2:       #e8eeff;
+    --surface:   #ffffff;
+    --card:      #ffffff;
+    --card2:     #f7f9ff;
+    --border:    #dde3f5;
+    --border2:   #c5d0f0;
+    --accent:    #3b5bdb;
+    --accent2:   #0ca678;
+    --accent3:   #f76707;
+    --success:   #099268;
+    --warning:   #e67700;
+    --danger:    #c92a2a;
+    --text:      #1a1f36;
+    --text2:     #3d4466;
+    --muted:     #8891b2;
+    --muted2:    #5c6490;
+    --glow:      rgba(59,91,219,0.12);
 }
-*,*::before,*::after{box-sizing:border-box;}
-html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;font-family:'Bricolage Grotesque',sans-serif!important;color:var(--text)!important;}
-[data-testid="stSidebar"]{background:var(--surface)!important;border-right:1px solid var(--border)!important;}
-[data-testid="stSidebar"]>div{padding-top:0!important;}
-.ofx-header{background:linear-gradient(160deg,#080e20 0%,#0d1528 40%,#0a1020 100%);border-bottom:1px solid var(--border2);padding:32px 40px 26px;margin-bottom:28px;position:relative;overflow:hidden;}
-.ofx-header::before{content:'';position:absolute;top:0;left:0;right:0;bottom:0;background:radial-gradient(ellipse 60% 80% at 10% 50%,rgba(79,142,247,0.07) 0%,transparent 60%),radial-gradient(ellipse 40% 60% at 90% 30%,rgba(0,212,170,0.06) 0%,transparent 60%);pointer-events:none;}
-.ofx-header-grid{position:absolute;top:0;left:0;right:0;bottom:0;background-image:linear-gradient(var(--border) 1px,transparent 1px),linear-gradient(90deg,var(--border) 1px,transparent 1px);background-size:40px 40px;opacity:0.25;pointer-events:none;}
-.ofx-title{font-family:'Bricolage Grotesque',sans-serif;font-size:2.4rem;font-weight:800;line-height:1.1;background:linear-gradient(110deg,#7eb8ff 0%,#4f8ef7 35%,#00d4aa 70%,#5ee7d0 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin:0 0 8px 0;}
-.ofx-subtitle{font-family:'Space Mono',monospace;font-size:0.72rem;color:var(--muted2);letter-spacing:0.06em;margin-bottom:12px;}
-.ofx-author{display:inline-flex;align-items:center;gap:10px;font-family:'Space Mono',monospace;font-size:0.68rem;color:var(--accent2);letter-spacing:0.12em;text-transform:uppercase;}
-.ofx-author::before,.ofx-author::after{content:'';display:block;width:24px;height:1px;background:var(--accent2);}
-.ofx-version-chip{display:inline-flex;align-items:center;gap:6px;background:rgba(79,142,247,0.12);border:1px solid rgba(79,142,247,0.3);border-radius:999px;padding:3px 10px;font-family:'Space Mono',monospace;font-size:0.65rem;color:var(--accent);margin-left:12px;vertical-align:middle;}
-.step-card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:22px 26px;margin-bottom:18px;position:relative;}
-.step-card::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent),var(--accent2));border-radius:14px 14px 0 0;}
-.step-header{display:flex;align-items:center;gap:12px;margin-bottom:16px;}
-.step-num{width:32px;height:32px;border-radius:50%;flex-shrink:0;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-family:'Bricolage Grotesque',sans-serif;font-weight:800;font-size:0.82rem;color:#fff;}
-.step-title{font-family:'Bricolage Grotesque',sans-serif;font-weight:700;font-size:1.05rem;color:var(--text);}
-.sb-section{background:var(--card);border:1px solid var(--border);border-radius:10px;padding:14px 16px;margin-bottom:14px;}
-.sb-title{font-family:'Bricolage Grotesque',sans-serif;font-size:0.72rem;font-weight:700;letter-spacing:0.1em;text-transform:uppercase;color:var(--accent);margin-bottom:12px;display:flex;align-items:center;gap:8px;}
-.sb-title::after{content:'';flex:1;height:1px;background:var(--border2);}
-.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:999px;font-family:'Space Mono',monospace;font-size:0.68rem;font-weight:400;}
-.pill-ok{background:rgba(34,197,94,.12);color:var(--success);border:1px solid rgba(34,197,94,.3);}
-.pill-warn{background:rgba(234,179,8,.12);color:var(--warning);border:1px solid rgba(234,179,8,.3);}
-.pill-info{background:rgba(79,142,247,.12);color:var(--accent);border:1px solid rgba(79,142,247,.3);}
-.pill-danger{background:rgba(239,68,68,.12);color:var(--danger);border:1px solid rgba(239,68,68,.3);}
-.pill-teal{background:rgba(0,212,170,.12);color:var(--accent2);border:1px solid rgba(0,212,170,.3);}
-.metrics-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px;}
-.metric-box{background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:14px 16px;}
-.metric-label{font-family:'Space Mono',monospace;font-size:0.62rem;color:var(--muted);letter-spacing:0.08em;text-transform:uppercase;margin-bottom:6px;}
-.metric-value{font-family:'Bricolage Grotesque',sans-serif;font-size:1.4rem;font-weight:700;color:var(--text);}
-.metric-value.blue{color:var(--accent);}.metric-value.green{color:var(--success);}.metric-value.red{color:var(--danger);}.metric-value.teal{color:var(--accent2);}.metric-value.orange{color:var(--accent3);}
-.ofx-preview{background:#040608;border:1px solid var(--border);border-left:3px solid var(--accent2);border-radius:10px;padding:16px 20px;font-family:'Space Mono',monospace;font-size:0.70rem;color:#94b8ff;line-height:1.8;max-height:320px;overflow-y:auto;overflow-x:auto;}
-.ofx-tag{color:#38bdf8;}.ofx-value{color:#a5f3fc;}.ofx-head{color:#7dd3fc;}
-.stButton>button{font-family:'Bricolage Grotesque',sans-serif!important;font-weight:700!important;letter-spacing:0.04em!important;border-radius:8px!important;border:1px solid var(--border2)!important;background:var(--card2)!important;color:var(--text)!important;transition:all 0.18s!important;}
-.stButton>button:hover{background:rgba(79,142,247,0.15)!important;border-color:var(--accent)!important;color:var(--accent)!important;}
-.stDownloadButton>button{font-family:'Bricolage Grotesque',sans-serif!important;font-weight:700!important;background:linear-gradient(135deg,#3b76e8,#00b894)!important;border:none!important;color:#fff!important;border-radius:8px!important;letter-spacing:0.04em!important;padding:10px 24px!important;width:100%!important;}
-.stSelectbox>div>div,.stTextInput>div>div>input,.stNumberInput>div>div>input,.stTextArea textarea{background:var(--card2)!important;border-color:var(--border2)!important;color:var(--text)!important;font-family:'Space Mono',monospace!important;font-size:0.80rem!important;border-radius:8px!important;}
-.stSelectbox [data-baseweb="select"]{background:var(--card2)!important;}
-[data-testid="stFileUploader"]{background:var(--card2)!important;border:2px dashed var(--border2)!important;border-radius:12px!important;}
-[data-testid="stFileUploader"]:hover{border-color:var(--accent)!important;}
-.stTabs [data-baseweb="tab-list"]{background:var(--surface)!important;border-radius:8px 8px 0 0!important;gap:2px!important;}
-.stTabs [data-baseweb="tab"]{font-family:'Bricolage Grotesque',sans-serif!important;font-weight:600!important;font-size:0.80rem!important;color:var(--muted2)!important;background:transparent!important;border-radius:6px 6px 0 0!important;}
-.stTabs [aria-selected="true"]{color:var(--accent)!important;background:var(--card)!important;}
-.stAlert{border-radius:10px!important;font-family:'Space Mono',monospace!important;font-size:0.78rem!important;}
-.streamlit-expanderHeader{font-family:'Space Mono',monospace!important;font-size:0.78rem!important;color:var(--muted2)!important;background:var(--card)!important;}
-details{background:var(--card)!important;border:1px solid var(--border)!important;border-radius:8px!important;}
-.stCheckbox>label{font-family:'Space Mono',monospace!important;font-size:0.78rem!important;color:var(--muted2)!important;}
-::-webkit-scrollbar{width:5px;height:5px;}::-webkit-scrollbar-track{background:var(--surface);}::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px;}::-webkit-scrollbar-thumb:hover{background:var(--accent);}
-hr{border-color:var(--border)!important;margin:24px 0!important;}
-.stProgress>div>div{background:linear-gradient(90deg,var(--accent),var(--accent2))!important;border-radius:999px!important;}
-.stRadio>label{font-family:'Space Mono',monospace!important;font-size:0.75rem!important;color:var(--muted2)!important;}
-.no-data-panel{background:var(--card);border:2px dashed var(--border2);border-radius:16px;padding:48px 32px;text-align:center;}
-.no-data-icon{font-size:3.5rem;margin-bottom:16px;}
-.no-data-title{font-family:'Bricolage Grotesque',sans-serif;font-weight:700;font-size:1rem;color:var(--muted2);margin-bottom:8px;}
-.no-data-sub{font-family:'Space Mono',monospace;font-size:0.68rem;color:var(--muted);line-height:1.8;}
-.validation-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--border);font-family:'Space Mono',monospace;font-size:0.70rem;color:var(--muted2);}
-.validation-row:last-child{border-bottom:none;}
-.v-icon{font-size:0.85rem;flex-shrink:0;}.v-ok{color:var(--success);}.v-warn{color:var(--warning);}.v-err{color:var(--danger);}
-.ofx-footer{text-align:center;padding:20px 0 8px;font-family:'Space Mono',monospace;font-size:0.65rem;color:var(--muted);}
-.ofx-footer a{color:var(--accent);text-decoration:none;}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body, [data-testid="stAppViewContainer"] {
+    background: var(--bg) !important;
+    font-family: 'Sora', sans-serif !important;
+    color: var(--text) !important;
+}
+
+/* Hide sidebar toggle */
+[data-testid="collapsedControl"] { display: none !important; }
+[data-testid="stSidebar"] { display: none !important; }
+section[data-testid="stSidebarContent"] { display: none !important; }
+
+/* Main content full width */
+.main .block-container {
+    max-width: 1280px !important;
+    padding: 2rem 2.5rem !important;
+}
+
+/* ── Hero Header ── */
+.ofx-hero {
+    background: linear-gradient(135deg, #3b5bdb 0%, #1971c2 35%, #0ca678 100%);
+    border-radius: 24px;
+    padding: 40px 48px;
+    margin-bottom: 32px;
+    position: relative;
+    overflow: hidden;
+    box-shadow: 0 20px 60px rgba(59,91,219,0.25);
+}
+.ofx-hero::before {
+    content: '';
+    position: absolute; top: -50%; right: -10%; width: 500px; height: 500px;
+    background: radial-gradient(circle, rgba(255,255,255,0.08) 0%, transparent 70%);
+    border-radius: 50%;
+}
+.ofx-hero::after {
+    content: '';
+    position: absolute; bottom: -30%; left: 20%; width: 300px; height: 300px;
+    background: radial-gradient(circle, rgba(12,166,120,0.15) 0%, transparent 70%);
+    border-radius: 50%;
+}
+.hero-dots {
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    background-image: radial-gradient(rgba(255,255,255,0.12) 1.5px, transparent 1.5px);
+    background-size: 28px 28px;
+    pointer-events: none;
+}
+.hero-content { position: relative; z-index: 1; }
+.hero-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.25);
+    border-radius: 999px; padding: 4px 12px;
+    font-family: 'DM Mono', monospace; font-size: 0.68rem; color: rgba(255,255,255,0.9);
+    letter-spacing: 0.08em; margin-bottom: 16px;
+}
+.hero-title {
+    font-family: 'Sora', sans-serif; font-size: 2.6rem; font-weight: 800;
+    color: #fff; line-height: 1.1; margin: 0 0 10px 0;
+}
+.hero-title span { opacity: 0.7; font-weight: 300; }
+.hero-sub {
+    font-family: 'DM Mono', monospace; font-size: 0.75rem;
+    color: rgba(255,255,255,0.7); letter-spacing: 0.05em; margin-bottom: 24px;
+}
+.hero-stats {
+    display: flex; gap: 32px; flex-wrap: wrap;
+}
+.hero-stat {
+    display: flex; flex-direction: column; gap: 2px;
+}
+.hero-stat-val {
+    font-family: 'Sora', sans-serif; font-size: 1.5rem; font-weight: 700; color: #fff;
+}
+.hero-stat-lbl {
+    font-family: 'DM Mono', monospace; font-size: 0.62rem;
+    color: rgba(255,255,255,0.6); letter-spacing: 0.1em; text-transform: uppercase;
+}
+
+/* ── Cards ── */
+.config-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;
+    margin-bottom: 24px;
+}
+.config-grid-2 { grid-template-columns: repeat(2, 1fr); }
+.config-grid-4 { grid-template-columns: repeat(4, 1fr); }
+
+.card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 20px 22px;
+    box-shadow: 0 2px 12px rgba(59,91,219,0.06);
+}
+.card-accent { border-top: 3px solid var(--accent); }
+.card-teal   { border-top: 3px solid var(--accent2); }
+.card-orange { border-top: 3px solid var(--accent3); }
+
+.card-title {
+    font-family: 'Sora', sans-serif; font-size: 0.70rem; font-weight: 700;
+    letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted);
+    margin-bottom: 14px; display: flex; align-items: center; gap: 8px;
+}
+.card-title::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+
+/* ── Step cards ── */
+.step-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 16px; padding: 24px 28px; margin-bottom: 20px;
+    box-shadow: 0 2px 16px rgba(59,91,219,0.07);
+    transition: box-shadow 0.2s;
+}
+.step-card:hover { box-shadow: 0 6px 28px rgba(59,91,219,0.12); }
+.step-header { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
+.step-num {
+    width: 36px; height: 36px; border-radius: 10px; flex-shrink: 0;
+    background: linear-gradient(135deg, var(--accent), #1971c2);
+    display: flex; align-items: center; justify-content: center;
+    font-family: 'Sora', sans-serif; font-weight: 800; font-size: 0.85rem; color: #fff;
+    box-shadow: 0 4px 12px rgba(59,91,219,0.3);
+}
+.step-title {
+    font-family: 'Sora', sans-serif; font-weight: 700; font-size: 1.05rem; color: var(--text);
+}
+.step-desc {
+    font-family: 'Sora', sans-serif; font-size: 0.78rem; color: var(--muted); margin-top: 2px;
+}
+
+/* ── Pills ── */
+.pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 4px 12px; border-radius: 999px;
+    font-family: 'DM Mono', monospace; font-size: 0.68rem; font-weight: 400;
+}
+.pill-ok     { background: rgba(9,146,104,.10);  color: #099268; border: 1px solid rgba(9,146,104,.25); }
+.pill-warn   { background: rgba(230,119,0,.10);  color: #e67700; border: 1px solid rgba(230,119,0,.25); }
+.pill-info   { background: rgba(59,91,219,.10);  color: var(--accent); border: 1px solid rgba(59,91,219,.25); }
+.pill-danger { background: rgba(201,42,42,.10);  color: #c92a2a; border: 1px solid rgba(201,42,42,.25); }
+.pill-teal   { background: rgba(12,166,120,.10); color: var(--accent2); border: 1px solid rgba(12,166,120,.25); }
+
+/* ── Metrics ── */
+.metrics-grid {
+    display: grid; grid-template-columns: repeat(4,1fr); gap: 14px; margin-bottom: 22px;
+}
+.metric-box {
+    background: var(--card2); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px 18px;
+}
+.metric-label {
+    font-family: 'DM Mono', monospace; font-size: 0.60rem; color: var(--muted);
+    letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 6px;
+}
+.metric-value { font-family: 'Sora', sans-serif; font-size: 1.5rem; font-weight: 700; }
+.metric-value.blue   { color: var(--accent); }
+.metric-value.green  { color: var(--success); }
+.metric-value.red    { color: var(--danger); }
+.metric-value.teal   { color: var(--accent2); }
+
+/* ── OFX Preview ── */
+.ofx-preview {
+    background: #1a1f36; border: 1px solid #2d3561;
+    border-left: 3px solid var(--accent2); border-radius: 12px;
+    padding: 16px 20px;
+    font-family: 'DM Mono', monospace; font-size: 0.70rem;
+    color: #8bb8ff; line-height: 1.9;
+    max-height: 300px; overflow-y: auto; overflow-x: auto;
+}
+.ofx-tag   { color: #60a5fa; }
+.ofx-value { color: #a5f3fc; }
+
+/* ── Buttons ── */
+.stButton > button {
+    font-family: 'Sora', sans-serif !important; font-weight: 600 !important;
+    border-radius: 10px !important; border: 1.5px solid var(--border2) !important;
+    background: var(--card) !important; color: var(--text) !important;
+    transition: all 0.18s !important;
+}
+.stButton > button:hover {
+    background: rgba(59,91,219,0.07) !important;
+    border-color: var(--accent) !important; color: var(--accent) !important;
+}
+.stDownloadButton > button {
+    font-family: 'Sora', sans-serif !important; font-weight: 700 !important;
+    background: linear-gradient(135deg, #3b5bdb, #0ca678) !important;
+    border: none !important; color: #fff !important;
+    border-radius: 10px !important; padding: 12px 24px !important;
+    width: 100% !important; box-shadow: 0 4px 16px rgba(59,91,219,0.25) !important;
+}
+
+/* ── Inputs ── */
+.stSelectbox > div > div,
+.stTextInput > div > div > input,
+.stNumberInput > div > div > input,
+.stTextArea textarea {
+    background: var(--card2) !important; border-color: var(--border2) !important;
+    color: var(--text) !important; font-family: 'DM Mono', monospace !important;
+    font-size: 0.82rem !important; border-radius: 10px !important;
+}
+.stSelectbox > div > div:focus-within,
+.stTextInput > div > div > input:focus {
+    border-color: var(--accent) !important;
+    box-shadow: 0 0 0 3px rgba(59,91,219,0.12) !important;
+}
+[data-baseweb="select"] { background: var(--card2) !important; }
+
+/* ── Labels ── */
+.stSelectbox label, .stTextInput label, .stNumberInput label, .stTextArea label,
+.stCheckbox label { 
+    font-family: 'Sora', sans-serif !important; font-size: 0.78rem !important;
+    font-weight: 600 !important; color: var(--text2) !important;
+}
+
+/* ── File uploader ── */
+[data-testid="stFileUploader"] {
+    background: linear-gradient(135deg, rgba(59,91,219,0.04), rgba(12,166,120,0.04)) !important;
+    border: 2px dashed var(--border2) !important;
+    border-radius: 16px !important;
+    transition: border-color 0.2s !important;
+}
+[data-testid="stFileUploader"]:hover { border-color: var(--accent) !important; }
+[data-testid="stFileUploader"] * { color: var(--text2) !important; }
+
+/* ── Tabs ── */
+.stTabs [data-baseweb="tab-list"] {
+    background: var(--bg2) !important; border-radius: 10px 10px 0 0 !important;
+    gap: 2px !important; padding: 4px !important;
+}
+.stTabs [data-baseweb="tab"] {
+    font-family: 'Sora', sans-serif !important; font-weight: 600 !important;
+    font-size: 0.80rem !important; color: var(--muted2) !important;
+    background: transparent !important; border-radius: 7px !important;
+}
+.stTabs [aria-selected="true"] {
+    color: var(--accent) !important; background: var(--card) !important;
+    box-shadow: 0 2px 8px rgba(59,91,219,0.12) !important;
+}
+.stTabs [data-baseweb="tab-panel"] {
+    background: var(--card) !important;
+    border: 1px solid var(--border) !important;
+    border-top: none !important;
+    border-radius: 0 0 12px 12px !important;
+    padding: 16px !important;
+}
+
+/* ── Alerts ── */
+.stAlert {
+    border-radius: 12px !important; font-family: 'Sora', sans-serif !important;
+    font-size: 0.82rem !important;
+}
+
+/* ── Expander ── */
+.streamlit-expanderHeader {
+    font-family: 'DM Mono', monospace !important; font-size: 0.78rem !important;
+    color: var(--muted2) !important; background: var(--card2) !important;
+    border-radius: 10px !important;
+}
+details { background: var(--card) !important; border: 1px solid var(--border) !important; border-radius: 12px !important; }
+
+/* ── Checkbox ── */
+.stCheckbox > label { font-family: 'Sora', sans-serif !important; font-size: 0.80rem !important; color: var(--text2) !important; }
+
+/* ── Progress bar ── */
+.stProgress > div > div { background: linear-gradient(90deg, var(--accent), var(--accent2)) !important; border-radius: 999px !important; }
+
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg2); border-radius: 3px; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+
+/* ── Divider ── */
+hr { border-color: var(--border) !important; margin: 24px 0 !important; }
+
+/* ── No-data ── */
+.no-data-panel {
+    background: linear-gradient(135deg, rgba(59,91,219,0.04), rgba(12,166,120,0.04));
+    border: 2px dashed var(--border2); border-radius: 20px;
+    padding: 56px 32px; text-align: center;
+}
+.no-data-icon { font-size: 3.5rem; margin-bottom: 16px; }
+.no-data-title { font-family: 'Sora', sans-serif; font-weight: 700; font-size: 1rem; color: var(--text2); margin-bottom: 8px; }
+.no-data-sub { font-family: 'DM Mono', monospace; font-size: 0.68rem; color: var(--muted); line-height: 2.0; }
+
+/* ── Validation ── */
+.validation-row {
+    display: flex; align-items: center; gap: 10px; padding: 7px 0;
+    border-bottom: 1px solid var(--border);
+    font-family: 'DM Mono', monospace; font-size: 0.72rem; color: var(--text2);
+}
+.validation-row:last-child { border-bottom: none; }
+.v-icon { font-size: 0.85rem; flex-shrink: 0; }
+.v-ok { color: var(--success); } .v-warn { color: var(--warning); } .v-err { color: var(--danger); }
+
+/* ── Footer ── */
+.ofx-footer {
+    text-align: center; padding: 20px 0 8px;
+    font-family: 'DM Mono', monospace; font-size: 0.65rem; color: var(--muted);
+}
+
+/* ── Section divider ── */
+.section-label {
+    font-family: 'Sora', sans-serif; font-size: 0.68rem; font-weight: 700;
+    letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted);
+    display: flex; align-items: center; gap: 10px; margin-bottom: 12px;
+}
+.section-label::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+
+/* ── Key indicator ── */
+.key-ok {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: rgba(9,146,104,.08); border: 1px solid rgba(9,146,104,.2);
+    border-radius: 8px; padding: 8px 12px;
+    font-family: 'DM Mono', monospace; font-size: 0.70rem; color: var(--success);
+}
+
+/* ── Country tabs ── */
+.country-strip {
+    display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px;
+}
+.ctry-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--card2); border: 1px solid var(--border);
+    border-radius: 8px; padding: 5px 12px;
+    font-family: 'Sora', sans-serif; font-size: 0.72rem; font-weight: 600; color: var(--muted2);
+}
+.ctry-chip span { font-size: 1rem; }
+
+/* Streamlit dataframe */
+[data-testid="stDataFrame"] { border-radius: 12px !important; overflow: hidden !important; }
 </style>
 """, unsafe_allow_html=True)
 
-st.markdown("""
-<div class="ofx-header">
-    <div class="ofx-header-grid"></div>
-    <div class="ofx-title">💳 OFX Converter <span style="opacity:.5">for</span> ODOO
-        <span class="ofx-version-chip">v3.2</span>
-    </div>
-    <div class="ofx-subtitle">// PDF · PDF-IMAGE · PDF-VECTORIEL · CSV · XLS · XLSX → OFX · Compatible ODOO 12–17 · OFX SGML v1.5.1</div>
-    <div class="ofx-author">Développé par Achraf BEN YOUNES</div>
-</div>
-""", unsafe_allow_html=True)
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONSTANTES
+# ═══════════════════════════════════════════════════════════════════════════════
 MAX_FILE_MB      = 25
 MAX_ROWS_WARNING = 5_000
 NONE_OPT         = "— Sélectionner —"
@@ -145,23 +410,63 @@ DATE_FORMATS = [
     "%d %m %Y",          "%m-%d-%Y",
 ]
 
+# ── Profils bancaires — France, Belgique, Suisse, Tunisie ──────────────────
 BANK_PROFILES = {
-    "Personnalisé":         {"bank_id": "000000000", "account_id": "FR76000000000000000000000000"},
-    "BNP Paribas":          {"bank_id": "BNPAFRPP",   "account_id": "FR76300900010000000000000"},
-    "Société Générale":     {"bank_id": "SOGEFRPP",   "account_id": "FR76300300000000000000000"},
-    "Crédit Agricole":      {"bank_id": "AGRIFRPP",   "account_id": "FR76183500000000000000000"},
-    "LCL":                  {"bank_id": "CRLYFRPP",   "account_id": "FR76305000000000000000000"},
-    "CIC":                  {"bank_id": "CMCIFRPP",   "account_id": "FR76100700000000000000000"},
-    "Crédit Mutuel":        {"bank_id": "CMBRFR2B",   "account_id": "FR76100700000000000000000"},
-    "La Banque Postale":    {"bank_id": "PSSTFRPPPAR","account_id": "FR76200410100000000000000"},
-    "HSBC France":          {"bank_id": "CCFRFRPP",   "account_id": "FR76300560000000000000000"},
-    "Boursorama":           {"bank_id": "BOUSFRPP",   "account_id": "FR76400000000000000000000"},
-    "Hello Bank":           {"bank_id": "BNPAFRPPIFB","account_id": "FR76300900010000000000000"},
-    "Fortuneo":             {"bank_id": "FTNOFRP1",   "account_id": "FR76130070000000000000000"},
-    "N26":                  {"bank_id": "NTSBDEB1",   "account_id": "DE00000000000000000000"},
-    "Revolut":              {"bank_id": "REVOLT21",   "account_id": "GB00REVO00000000000000"},
-    "Orange Bank":          {"bank_id": "BNPAFRPP",   "account_id": "FR76000000000000000000000"},
-    "Qonto":                {"bank_id": "QNTOFRP1XXX","account_id": "FR76169580000178951302618940"},
+    # ── FRANCE ────────────────────────────────────────────────────────────────
+    "🇫🇷 Qonto":               {"bank_id": "QNTOFRP1XXX", "account_id": "FR76169580000178951302618940", "currency": "EUR"},
+    "🇫🇷 BNP Paribas":         {"bank_id": "BNPAFRPP",    "account_id": "FR76300900010000000000000",    "currency": "EUR"},
+    "🇫🇷 Société Générale":    {"bank_id": "SOGEFRPP",    "account_id": "FR76300300000000000000000",    "currency": "EUR"},
+    "🇫🇷 Crédit Agricole":     {"bank_id": "AGRIFRPP",    "account_id": "FR76183500000000000000000",    "currency": "EUR"},
+    "🇫🇷 LCL":                 {"bank_id": "CRLYFRPP",    "account_id": "FR76305000000000000000000",    "currency": "EUR"},
+    "🇫🇷 CIC":                 {"bank_id": "CMCIFRPP",    "account_id": "FR76100700000000000000000",    "currency": "EUR"},
+    "🇫🇷 Crédit Mutuel":       {"bank_id": "CMBRFR2B",    "account_id": "FR76100700000000000000000",    "currency": "EUR"},
+    "🇫🇷 La Banque Postale":   {"bank_id": "PSSTFRPPPAR", "account_id": "FR76200410100000000000000",    "currency": "EUR"},
+    "🇫🇷 HSBC France":         {"bank_id": "CCFRFRPP",    "account_id": "FR76300560000000000000000",    "currency": "EUR"},
+    "🇫🇷 Boursorama":          {"bank_id": "BOUSFRPP",    "account_id": "FR76400000000000000000000",    "currency": "EUR"},
+    "🇫🇷 Hello Bank":          {"bank_id": "BNPAFRPPIFB", "account_id": "FR76300900010000000000000",    "currency": "EUR"},
+    "🇫🇷 Fortuneo":            {"bank_id": "FTNOFRP1",    "account_id": "FR76130070000000000000000",    "currency": "EUR"},
+    "🇫🇷 Orange Bank":         {"bank_id": "BNPAFRPP",    "account_id": "FR76000000000000000000000",    "currency": "EUR"},
+    "🇫🇷 Caisse d'Épargne":    {"bank_id": "CEPAFRPP",    "account_id": "FR76159000000000000000000",    "currency": "EUR"},
+    "🇫🇷 Banque Populaire":    {"bank_id": "CCBPFRPPNAN", "account_id": "FR76104000000000000000000",    "currency": "EUR"},
+    "🇫🇷 Crédit du Nord":      {"bank_id": "NORDFRPP",    "account_id": "FR76300920000000000000000",    "currency": "EUR"},
+    "🇫🇷 AXA Banque":          {"bank_id": "AXABFRPP",    "account_id": "FR76190200000000000000000",    "currency": "EUR"},
+    "🇫🇷 Revolut (FR)":        {"bank_id": "REVOLT21",    "account_id": "FR76000000000000000000000",    "currency": "EUR"},
+    "🇫🇷 N26 (FR)":            {"bank_id": "NTSBDEB1",    "account_id": "DE00000000000000000000",       "currency": "EUR"},
+    # ── BELGIQUE ───────────────────────────────────────────────────────────────
+    "🇧🇪 BNP Paribas Fortis":  {"bank_id": "GEBABEBB",    "account_id": "BE00000000000000",             "currency": "EUR"},
+    "🇧🇪 ING Belgique":        {"bank_id": "BBRUBEBB",    "account_id": "BE00000000000000",             "currency": "EUR"},
+    "🇧🇪 KBC":                 {"bank_id": "KREDBEBB",    "account_id": "BE00000000000000",             "currency": "EUR"},
+    "🇧🇪 Belfius":             {"bank_id": "GKCCBEBB",    "account_id": "BE00000000000000",             "currency": "EUR"},
+    "🇧🇪 Argenta":             {"bank_id": "ARSPBE22",    "account_id": "BE00000000000000",             "currency": "EUR"},
+    "🇧🇪 Fintro":              {"bank_id": "GEBABEBB",    "account_id": "BE00000000000000",             "currency": "EUR"},
+    "🇧🇪 Nagelmackers":        {"bank_id": "NICABEBB",    "account_id": "BE00000000000000",             "currency": "EUR"},
+    "🇧🇪 Crelan":              {"bank_id": "NICABEBB",    "account_id": "BE00000000000000",             "currency": "EUR"},
+    # ── SUISSE ────────────────────────────────────────────────────────────────
+    "🇨🇭 UBS":                 {"bank_id": "UBSWCHZH",    "account_id": "CH0000000000000000000",        "currency": "CHF"},
+    "🇨🇭 Credit Suisse":       {"bank_id": "CRESCHZZ",    "account_id": "CH0000000000000000000",        "currency": "CHF"},
+    "🇨🇭 Raiffeisen":          {"bank_id": "RAIFCH22",    "account_id": "CH0000000000000000000",        "currency": "CHF"},
+    "🇨🇭 PostFinance":         {"bank_id": "POFICHBE",    "account_id": "CH0000000000000000000",        "currency": "CHF"},
+    "🇨🇭 ZKB":                 {"bank_id": "ZKBKCHZZ",    "account_id": "CH0000000000000000000",        "currency": "CHF"},
+    "🇨🇭 Cantonal Vaud (BCVS)":{"bank_id": "BCVLCH2L",   "account_id": "CH0000000000000000000",        "currency": "CHF"},
+    "🇨🇭 Neon":                {"bank_id": "RAIFCH22",    "account_id": "CH0000000000000000000",        "currency": "CHF"},
+    "🇨🇭 Yuh":                 {"bank_id": "POFICHBE",    "account_id": "CH0000000000000000000",        "currency": "CHF"},
+    # ── TUNISIE ────────────────────────────────────────────────────────────────
+    "🇹🇳 STB":                 {"bank_id": "STBKTNTT",    "account_id": "TN59000000000000000000",       "currency": "TND"},
+    "🇹🇳 BNA":                 {"bank_id": "BNATTNTT",    "account_id": "TN59000000000000000000",       "currency": "TND"},
+    "🇹🇳 Attijari Bank TN":    {"bank_id": "BSTUTNTT",    "account_id": "TN59000000000000000000",       "currency": "TND"},
+    "🇹🇳 BIAT":                {"bank_id": "BIATTNTT",    "account_id": "TN59000000000000000000",       "currency": "TND"},
+    "🇹🇳 UIB":                 {"bank_id": "UIBATNTT",    "account_id": "TN59000000000000000000",       "currency": "TND"},
+    "🇹🇳 Amen Bank":           {"bank_id": "CFCTTNTT",    "account_id": "TN59000000000000000000",       "currency": "TND"},
+    "🇹🇳 BH Bank":             {"bank_id": "BHBKTNTT",    "account_id": "TN59000000000000000000",       "currency": "TND"},
+    "🇹🇳 BT (Banque de Tunis)":{"bank_id": "BTUNTNTT",    "account_id": "TN59000000000000000000",       "currency": "TND"},
+    "🇹🇳 Zitouna Bank":        {"bank_id": "ZITUTNTT",    "account_id": "TN59000000000000000000",       "currency": "TND"},
+    "🇹🇳 QNB Tunisie":         {"bank_id": "QNBATSTT",    "account_id": "TN59000000000000000000",       "currency": "TND"},
+    # ── PERSONNALISÉ ────────────────────────────────────────────────────────────
+    "⚙️ Personnalisé":         {"bank_id": "000000000",   "account_id": "FR76000000000000000000000000", "currency": "EUR"},
+}
+
+CURRENCIES_BY_COUNTRY = {
+    "🇫🇷": "EUR", "🇧🇪": "EUR", "🇨🇭": "CHF", "🇹🇳": "TND"
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -283,57 +588,27 @@ def build_ofx(transactions, bank_id, account_id, account_type, currency, languag
     return header + "\r\n".join(lines)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# GCV API KEY
+# GCV
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _get_gcv_api_key() -> str:
-    """Lit la clé GCV depuis st.secrets EN PREMIER, puis session_state."""
     try:
         key = st.secrets.get("GCV_API_KEY", "")
-        if key:
-            return key
-    except Exception:
-        pass
+        if key: return key
+    except Exception: pass
     return st.session_state.get("gcv_api_key", "")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# [FIX v3.2] RASTERISATION PDF VIA pdf2image (pdftoppm)
-# Remplace _rasterize_pdf_page qui utilisait pdfplumber.to_image
-# pdfplumber.to_image dépend de wand/ghostscript -> peut retourner None sur
-# Streamlit Cloud. pdf2image (pdftoppm/poppler-utils) est toujours disponible.
-# ═══════════════════════════════════════════════════════════════════════════════
-
 def _rasterize_pdf_bytes_to_images(raw_bytes: bytes, dpi: int = 200) -> list:
-    """
-    Convertit un PDF (bytes) en liste d'images PIL via pdf2image (pdftoppm).
-    Fonctionne sur TOUS types de PDF : texte, vectoriel, scanné.
-    
-    Retourne une liste de PIL.Image.Image.
-    Lève ImportError si pdf2image n'est pas installé.
-    
-    requirements.txt : pdf2image>=2.7.0
-    packages.txt     : poppler-utils
-    """
     try:
         from pdf2image import convert_from_bytes
     except ImportError:
-        raise ImportError(
-            "pdf2image manquant. Ajoutez 'pdf2image>=2.7.0' dans requirements.txt "
-            "et 'poppler-utils' dans packages.txt (Streamlit Cloud)."
-        )
+        raise ImportError("pdf2image manquant. Ajoutez 'pdf2image>=2.7.0' dans requirements.txt et 'poppler-utils' dans packages.txt.")
     return convert_from_bytes(raw_bytes, dpi=dpi, fmt="JPEG")
 
-
 def _image_to_base64_jpeg(img, quality: int = 85) -> str:
-    """Encode une PIL.Image en base64 JPEG."""
     buf = BytesIO()
     img.convert("RGB").save(buf, format="JPEG", quality=quality)
     return base64.b64encode(buf.getvalue()).decode("utf-8")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# GCV OCR (inchangé sauf rasterisation)
-# ═══════════════════════════════════════════════════════════════════════════════
 
 def _ocr_page_google_vision(img, api_key: str) -> str:
     import json, urllib.request, urllib.error
@@ -343,28 +618,22 @@ def _ocr_page_google_vision(img, api_key: str) -> str:
         "requests": [{
             "image": {"content": img_b64},
             "features": [{"type": "DOCUMENT_TEXT_DETECTION", "maxResults": 1}],
-            "imageContext": {
-                "languageHints": ["fr", "en"],
-                "textDetectionParams": {"enableTextDetectionConfidenceScore": True}
-            }
+            "imageContext": {"languageHints": ["fr","en","de"],
+                             "textDetectionParams": {"enableTextDetectionConfidenceScore": True}}
         }]
     }).encode("utf-8")
     url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
-    req = urllib.request.Request(url, data=payload,
-                                  headers={"Content-Type": "application/json"}, method="POST")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read().decode("utf-8"))
         responses = result.get("responses", [])
         if not responses: return ""
-        ann = responses[0].get("fullTextAnnotation", {})
-        return ann.get("text", "")
+        return responses[0].get("fullTextAnnotation", {}).get("text", "")
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        err_json = {}
-        try: err_json = json.loads(body)
-        except Exception: pass
-        err_msg = err_json.get("error", {}).get("message", body[:200])
+        try: err_msg = json.loads(body).get("error", {}).get("message", body[:200])
+        except: err_msg = body[:200]
         st.warning(f"⚠️ Google Vision API : {err_msg}")
         return ""
     except Exception as e:
@@ -386,16 +655,14 @@ def parse_qonto_gcv_text(text: str) -> pd.DataFrame:
     header_idx = None
     for i, line in enumerate(lines):
         ll = line.lower()
-        if ("date" in ll or "valeur" in ll) and (
-            "transaction" in ll or "débit" in ll or "debit" in ll or "crédit" in ll
-        ):
+        if ("date" in ll or "valeur" in ll) and ("transaction" in ll or "débit" in ll or "debit" in ll or "crédit" in ll):
             header_idx = i; break
     if header_idx is None: return pd.DataFrame()
     date_pat = re.compile(r'^(\d{1,2}/\d{2}(?:/\d{2,4})?)\s+(.*)')
-    amount_pat = re.compile(r'([+\-]\s*[\d\s.,]+\s*EUR)', re.IGNORECASE)
-    skip_kw = {"toutes les cartes","apple pay","google pay","marque de","agréé",
-               "du 0","iban:","bic:","solde au","solde de","entrées","sorties",
-               "relevé","relevés","sas ","rue ","paris","france"}
+    amount_pat = re.compile(r'([+\-]\s*[\d\s.,]+\s*(?:EUR|CHF|TND|USD|GBP))', re.IGNORECASE)
+    skip_kw = {"toutes les cartes","apple pay","google pay","marque de","agréé","du 0",
+               "iban:","bic:","solde au","solde de","entrées","sorties","relevé","relevés",
+               "sas ","rue ","paris","france","belgium","suisse","tunisie","bruxelles"}
     transactions = []
     current = None
     for line in lines[header_idx + 1:]:
@@ -449,7 +716,7 @@ def _parse_ocr_text_to_df(all_text: str) -> pd.DataFrame:
     if not lines_data: return pd.DataFrame()
     max_cols = max(len(r) for r in lines_data)
     rows_padded = [r + [""] * (max_cols - len(r)) for r in lines_data]
-    date_kw = {"date","jour","day","opération","operation","valeur","libellé","libelle","montant","amount","débit","crédit"}
+    date_kw = {"date","jour","day","opération","operation","valeur","libellé","libelle","montant","amount","débit","crédit","datum","betrag"}
     header_idx = 0; best_score = 0
     for i, row in enumerate(rows_padded[:15]):
         row_lower = " ".join(row).lower()
@@ -466,35 +733,16 @@ def _parse_ocr_text_to_df(all_text: str) -> pd.DataFrame:
     return pd.DataFrame(data, columns=unique_h)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PARSE PDF — v3.2 AVEC FIX RASTERISATION
+# PDF PARSER v3.2
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def parse_pdf(file, gcv_api_key: str = "") -> tuple:
-    """
-    Parser PDF universel v3.2.
-
-    Cascade :
-    1. pdfplumber tables   — PDF texte avec tableaux bordurés
-    2. camelot lattice     — PDF avec bordures de tableau
-    3. camelot stream      — PDF en colonnes sans bordures
-    4. tabula-py           — moteur Java
-    5. pdfplumber texte    — extraction texte brut
-    6. Géométrie mots      — extraction words avec tolérance max
-    7. [FIX v3.2] GCV OCR — pdf2image → JPEG → Google Cloud Vision
-       (remplace l'ancienne rasterisation pdfplumber.to_image)
-    """
     raw = _read_bytes(file)
-
-    # ── Passe 1 : pdfplumber tables ──────────────────────────────────────────
     rows = []
     try:
         with pdfplumber.open(BytesIO(raw)) as pdf:
             for page in pdf.pages:
-                tables = page.extract_tables({
-                    "vertical_strategy": "lines",
-                    "horizontal_strategy": "lines",
-                    "intersection_x_tolerance": 15,
-                }) or []
+                tables = page.extract_tables({"vertical_strategy":"lines","horizontal_strategy":"lines","intersection_x_tolerance":15}) or []
                 if not tables: tables = page.extract_tables() or []
                 for table in tables:
                     for row in table:
@@ -505,63 +753,41 @@ def parse_pdf(file, gcv_api_key: str = "") -> tuple:
         df = _rows_to_df(rows)
         if not df.empty: return df, "pdfplumber-tables"
 
-    # ── Passe 2 : camelot lattice ────────────────────────────────────────────
-    try:
-        import camelot, tempfile, os
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(raw); tmp_path = tmp.name
+    for flavor in ["lattice","stream"]:
         try:
-            tables = camelot.read_pdf(tmp_path, flavor="lattice", pages="all")
-            if tables and len(tables) > 0:
-                dfs = [t.df for t in tables if not t.df.empty]
-                if dfs:
-                    combined = pd.concat(dfs, ignore_index=True)
-                    combined.columns = [str(c).strip() for c in combined.columns]
-                    return combined, "camelot-lattice"
-        finally:
-            try: os.unlink(tmp_path)
-            except Exception: pass
-    except Exception: pass
+            import camelot, tempfile, os
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(raw); tmp_path = tmp.name
+            try:
+                tables = camelot.read_pdf(tmp_path, flavor=flavor, pages="all")
+                if tables and len(tables) > 0:
+                    dfs = [t.df for t in tables if not t.df.empty and len(t.df) > 1]
+                    if dfs:
+                        combined = pd.concat(dfs, ignore_index=True)
+                        combined.columns = [str(c).strip() for c in combined.columns]
+                        return combined, f"camelot-{flavor}"
+            finally:
+                try: os.unlink(tmp_path)
+                except: pass
+        except Exception: pass
 
-    # ── Passe 3 : camelot stream ─────────────────────────────────────────────
-    try:
-        import camelot, tempfile, os
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(raw); tmp_path = tmp.name
-        try:
-            tables = camelot.read_pdf(tmp_path, flavor="stream", pages="all")
-            if tables and len(tables) > 0:
-                dfs = [t.df for t in tables if not t.df.empty and len(t.df) > 1]
-                if dfs:
-                    combined = pd.concat(dfs, ignore_index=True)
-                    combined.columns = [str(c).strip() for c in combined.columns]
-                    return combined, "camelot-stream"
-        finally:
-            try: os.unlink(tmp_path)
-            except Exception: pass
-    except Exception: pass
-
-    # ── Passe 4 : tabula-py ──────────────────────────────────────────────────
     try:
         import tabula, tempfile, os
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             tmp.write(raw); tmp_path = tmp.name
         try:
-            dfs = tabula.read_pdf(tmp_path, pages="all", multiple_tables=True,
-                                   silent=True, pandas_options={"dtype": str})
-            dfs = [d for d in dfs if not d.empty and len(d) > 0]
+            dfs = tabula.read_pdf(tmp_path, pages="all", multiple_tables=True, silent=True, pandas_options={"dtype": str})
+            dfs = [d for d in dfs if not d.empty]
             if dfs:
                 combined = pd.concat(dfs, ignore_index=True)
                 combined.columns = [str(c).strip() for c in combined.columns]
                 return combined, "tabula"
         finally:
             try: os.unlink(tmp_path)
-            except Exception: pass
+            except: pass
     except Exception: pass
 
-    # ── Passe 5 : pdfplumber texte ───────────────────────────────────────────
-    text_lines = []
-    _has_curves = False
+    text_lines = []; _has_curves = False
     try:
         with pdfplumber.open(BytesIO(raw)) as pdf:
             for page in pdf.pages:
@@ -577,13 +803,11 @@ def parse_pdf(file, gcv_api_key: str = "") -> tuple:
         df = _parse_ocr_text_to_df(all_text)
         if not df.empty: return df, "pdfplumber-text"
 
-    # ── Passe 6 : Géométrie mots (récupération tolerante) ────────────────────
     try:
         with pdfplumber.open(BytesIO(raw)) as pdf:
             recovered_lines = []
             for page in pdf.pages:
-                words = page.extract_words(x_tolerance=1.5, y_tolerance=3,
-                                            horizontal_ltr=True, use_text_flow=True)
+                words = page.extract_words(x_tolerance=1.5, y_tolerance=3, horizontal_ltr=True, use_text_flow=True)
                 if words:
                     line_map = {}
                     for w in words:
@@ -600,27 +824,21 @@ def parse_pdf(file, gcv_api_key: str = "") -> tuple:
                 if not df.empty: return df, "vector-geometry-engine"
     except Exception: pass
 
-    # ── Passe 7 : [FIX v3.2] GCV OCR via pdf2image ───────────────────────────
-    # CORRECTIF : utilise pdf2image (pdftoppm/poppler-utils) pour la rasterisation
-    # au lieu de pdfplumber.to_image() qui dépend de wand/ghostscript.
-    # pdf2image est fiable sur TOUS types de PDF vectoriels sur Streamlit Cloud.
+    # GCV via pdf2image
     key = gcv_api_key or _get_gcv_api_key()
     if key:
         try:
             page_images = _rasterize_pdf_bytes_to_images(raw, dpi=200)
         except ImportError as e:
-            st.warning(f"⚠️ {e}")
-            page_images = []
+            st.warning(f"⚠️ {e}"); page_images = []
         except Exception as e:
-            st.warning(f"⚠️ Rasterisation PDF : {e}")
-            page_images = []
+            st.warning(f"⚠️ Rasterisation PDF : {e}"); page_images = []
 
         if page_images:
             ocr_texts = []
             for img in page_images:
                 text = _ocr_page_google_vision(img, key)
                 if text.strip(): ocr_texts.append(text)
-
             if ocr_texts:
                 all_ocr = "\n".join(ocr_texts)
                 df = _parse_ocr_text_to_df(all_ocr)
@@ -628,11 +846,10 @@ def parse_pdf(file, gcv_api_key: str = "") -> tuple:
                     label = "google-vision-ocr (Qonto)" if _is_qonto_format(all_ocr) else "google-vision-ocr"
                     return df, label
 
-    # ── Tesseract (hors Streamlit Cloud) ─────────────────────────────────────
     if HAS_TESSERACT:
-        ocr_texts = []
         try:
             page_images = _rasterize_pdf_bytes_to_images(raw, dpi=300)
+            ocr_texts = []
             for img in page_images:
                 text = pytesseract.image_to_string(img, lang="fra+eng")
                 if text.strip(): ocr_texts.append(text)
@@ -643,7 +860,6 @@ def parse_pdf(file, gcv_api_key: str = "") -> tuple:
         except Exception: pass
 
     return pd.DataFrame(), "failed"
-
 
 def _rows_to_df(rows: list) -> pd.DataFrame:
     if not rows: return pd.DataFrame()
@@ -656,11 +872,10 @@ def _rows_to_df(rows: list) -> pd.DataFrame:
         cnt = seen.get(key, 0)
         unique_h.append(key if cnt == 0 else f"{key}_{cnt}")
         seen[key] = cnt + 1
-    data_padded = [r + [""] * (max_cols - len(r)) for r in data]
-    return pd.DataFrame(data_padded, columns=unique_h)
+    return pd.DataFrame([r + [""]*(max_cols-len(r)) for r in data], columns=unique_h)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CSV / EXCEL PARSERS (inchangés)
+# CSV / EXCEL
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def parse_csv(file) -> pd.DataFrame:
@@ -681,7 +896,7 @@ def parse_csv(file) -> pd.DataFrame:
     return _clean_df(df)
 
 def _detect_separator(sample_lines: list) -> str:
-    sep_counts = {";": 0, ",": 0, "\t": 0, "|": 0}
+    sep_counts = {";":0,",":0,"\t":0,"|":0}
     for line in sample_lines:
         if not line.strip(): continue
         for sep in sep_counts: sep_counts[sep] = max(sep_counts[sep], line.count(sep))
@@ -689,8 +904,7 @@ def _detect_separator(sample_lines: list) -> str:
     return best_sep if sep_counts[best_sep] >= 2 else ","
 
 def _find_header_row(lines: list, sep: str) -> int:
-    date_kw = {"date","jour","day","dt","valeur","opération","operation","mouvement",
-               "libellé","libelle","montant","amount"}
+    date_kw = {"date","jour","day","dt","valeur","opération","operation","mouvement","libellé","libelle","montant","amount","datum","betrag"}
     for i, line in enumerate(lines[:25]):
         if not line.strip(): continue
         cols = [c.strip().strip('"').lower() for c in line.split(sep)]
@@ -723,8 +937,7 @@ def parse_excel(raw_bytes: bytes, sheet_name=None) -> pd.DataFrame:
     return pd.DataFrame()
 
 def _find_excel_header(df: pd.DataFrame) -> pd.DataFrame:
-    date_kw = {"date","jour","day","montant","amount","libellé","libelle","opération","operation",
-               "valeur","débit","crédit","credit","debit"}
+    date_kw = {"date","jour","day","montant","amount","libellé","libelle","opération","operation","valeur","débit","crédit","credit","debit","datum","betrag"}
     for i, row in df.iterrows():
         row_str = " ".join(str(v).lower() for v in row if not _is_na(v))
         if sum(1 for kw in date_kw if kw in row_str) >= 1:
@@ -739,14 +952,15 @@ def _find_excel_header(df: pd.DataFrame) -> pd.DataFrame:
 def auto_map_columns(df: pd.DataFrame) -> dict:
     mapping = {k: None for k in ("date","amount","debit","credit","name","memo")}
     kw_map = {
-        "date":   ["date de valeur","date de l'opération","date opération","date operation",
-                   "date valeur","dateop","date d'opération","date comptable","date","jour","day","dt"],
-        "debit":  ["débit","debit","retrait","withdrawal","sortie","montant débit","montant debit","dépense","depense"],
-        "credit": ["crédit","credit","versement","deposit","entrée","entree","montant crédit","montant credit","recette"],
-        "amount": ["montant (eur)","montant (usd)","montant_brut","montant","amount","somme","sum","trnamt","value","total","net","prix"],
+        "date":   ["date de valeur","date de l'opération","date opération","date operation","date valeur",
+                   "dateop","date d'opération","date comptable","date","jour","day","dt","datum","buchungsdatum","valutadatum"],
+        "debit":  ["débit","debit","retrait","withdrawal","sortie","montant débit","montant debit","dépense","depense","ausgabe","lastschrift","belastung"],
+        "credit": ["crédit","credit","versement","deposit","entrée","entree","montant crédit","montant credit","recette","gutschrift","eingang"],
+        "amount": ["montant (eur)","montant (chf)","montant (tnd)","montant (usd)","montant_brut","montant","amount","somme","sum","trnamt",
+                   "value","total","net","prix","betrag","saldo"],
         "name":   ["libellé opération","libellé","libelle","label","description","transactions","intitulé","intitule",
-                   "référence","reference","nom","name","communication","motif opération","wording"],
-        "memo":   ["note","catégorie","categorie","memo","motif","objet","détail","detail","commentaire","complément","complement","information"],
+                   "référence","reference","nom","name","communication","motif opération","wording","buchungstext","verwendungszweck"],
+        "memo":   ["note","catégorie","categorie","memo","motif","objet","détail","detail","commentaire","complément","complement","information","mitteilung"],
     }
     cols_lower = {c.lower().strip(): c for c in df.columns}
     used = set()
@@ -787,99 +1001,101 @@ def validate_ofx(ofx_str: str) -> list:
 defaults = {
     "ofx_content": None, "ofx_filename": None, "df_parsed": None,
     "parse_method": None, "downloaded": False, "file_deleted": False,
-    "bank_profile": "Personnalisé", "raw_pdf_bytes": None, "raw_pdf_name": None,
-    "last_gcv_key": "",
+    "raw_pdf_bytes": None, "raw_pdf_name": None, "last_gcv_key": "",
 }
 for k, v in defaults.items():
     if k not in st.session_state: st.session_state[k] = v
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
+# HERO HEADER
 # ═══════════════════════════════════════════════════════════════════════════════
-with st.sidebar:
+_gcv_ready = bool(_get_gcv_api_key())
+
+st.markdown(f"""
+<div class="ofx-hero">
+    <div class="hero-dots"></div>
+    <div class="hero-content">
+        <div class="hero-badge">✦ v4.0 · OFX SGML v1.5.1 · Odoo 12–17</div>
+        <div class="hero-title">💳 OFX Converter <span>for</span> Odoo</div>
+        <div class="hero-sub">// PDF · CSV · XLSX → OFX · France · Belgique · Suisse · Tunisie</div>
+        <div class="hero-stats">
+            <div class="hero-stat"><div class="hero-stat-val">45+</div><div class="hero-stat-lbl">Banques</div></div>
+            <div class="hero-stat"><div class="hero-stat-val">4</div><div class="hero-stat-lbl">Pays</div></div>
+            <div class="hero-stat"><div class="hero-stat-val">{"✓ GCV" if _gcv_ready else "—"}</div><div class="hero-stat-lbl">OCR Vision</div></div>
+            <div class="hero-stat"><div class="hero-stat-val">100%</div><div class="hero-stat-lbl">Odoo compat.</div></div>
+        </div>
+    </div>
+</div>
+""", unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CONFIGURATION INLINE (remplace la sidebar)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with st.expander("⚙️ Configuration — Banque · Compte · OCR", expanded=True):
+    st.markdown('<div class="section-label">Profil bancaire</div>', unsafe_allow_html=True)
+
+    # Country filter
     st.markdown("""
-    <div style="padding:20px 4px 16px;text-align:center;">
-        <div style="font-family:'Bricolage Grotesque',sans-serif;font-size:1.2rem;
-                    font-weight:800;background:linear-gradient(90deg,#7eb8ff,#00d4aa);
-                    -webkit-background-clip:text;-webkit-text-fill-color:transparent;
-                    background-clip:text;">⚙️ Configuration</div>
+    <div class="country-strip">
+        <div class="ctry-chip"><span>🇫🇷</span> France</div>
+        <div class="ctry-chip"><span>🇧🇪</span> Belgique</div>
+        <div class="ctry-chip"><span>🇨🇭</span> Suisse</div>
+        <div class="ctry-chip"><span>🇹🇳</span> Tunisie</div>
     </div>
     """, unsafe_allow_html=True)
 
-    st.markdown('<div class="sb-section"><div class="sb-title">🏛️ Profil Bancaire</div>', unsafe_allow_html=True)
-    selected_profile = st.selectbox("Banque / Établissement", list(BANK_PROFILES.keys()),
-                                     index=list(BANK_PROFILES.keys()).index(st.session_state.bank_profile),
-                                     key="profile_select")
-    st.session_state.bank_profile = selected_profile
-    profile_data = BANK_PROFILES[selected_profile]
-    bank_id = st.text_input("Bank ID / BIC", value=profile_data["bank_id"])
-    account_id = st.text_input("Account ID / IBAN", value=profile_data["account_id"])
-    st.markdown("</div>", unsafe_allow_html=True)
+    cfg_col1, cfg_col2, cfg_col3 = st.columns([2, 2, 1])
+    with cfg_col1:
+        selected_profile = st.selectbox("🏛️ Banque / Établissement", list(BANK_PROFILES.keys()), key="profile_select")
+        profile_data = BANK_PROFILES[selected_profile]
+    with cfg_col2:
+        bank_id = st.text_input("BIC / Bank ID", value=profile_data["bank_id"])
+    with cfg_col3:
+        # Auto-detect currency from profile
+        default_currency = profile_data.get("currency", "EUR")
+        all_currencies = ["EUR","CHF","TND","USD","GBP","MAD","DZD","CAD","SGD","JPY"]
+        currency = st.selectbox("Devise", all_currencies, index=all_currencies.index(default_currency))
 
-    st.markdown('<div class="sb-section"><div class="sb-title">💰 Paramètres Compte</div>', unsafe_allow_html=True)
-    account_type = st.selectbox("Type de compte", ["CHECKING","SAVINGS","CREDITLINE"])
-    currency = st.selectbox("Devise", ["EUR","USD","GBP","MAD","TND","DZD","CHF","CAD","SGD","JPY"])
-    opening_bal = st.number_input("Solde d'ouverture", value=0.0, step=0.01, format="%.2f",
-                                   help="Solde AVANT la première transaction du relevé.")
-    language = st.selectbox("Langue OFX", ["ENG","FRA"], index=0, help="ENG recommandé pour Odoo 12/13")
-    st.markdown("</div>", unsafe_allow_html=True)
+    account_id = st.text_input("IBAN / Account ID", value=profile_data["account_id"])
 
-    st.markdown('<div class="sb-section"><div class="sb-title">📄 Fichier de Sortie</div>', unsafe_allow_html=True)
-    ofx_filename_input = st.text_input("Nom du fichier OFX", value="transactions_odoo")
-    st.markdown("</div>", unsafe_allow_html=True)
+    cfg_col4, cfg_col5, cfg_col6, cfg_col7 = st.columns(4)
+    with cfg_col4:
+        account_type = st.selectbox("Type de compte", ["CHECKING","SAVINGS","CREDITLINE"])
+    with cfg_col5:
+        opening_bal = st.number_input("Solde d'ouverture", value=0.0, step=0.01, format="%.2f",
+                                       help="Solde AVANT la 1ère transaction")
+    with cfg_col6:
+        language = st.selectbox("Langue OFX", ["ENG","FRA"], index=0)
+    with cfg_col7:
+        ofx_filename_input = st.text_input("Nom du fichier", value="transactions_odoo")
 
-    # ── Google Cloud Vision API ────────────────────────────────────────────
-    st.markdown('''<div class="sb-section"><div class="sb-title">🔍 OCR — PDF (Google Vision)</div>''',
-                unsafe_allow_html=True)
+    st.markdown('<div class="section-label" style="margin-top:16px;">OCR — PDF vectoriels (Qonto, Revolut…)</div>', unsafe_allow_html=True)
 
     _secret_key = ""
     try: _secret_key = st.secrets.get("GCV_API_KEY", "")
     except Exception: pass
 
-    if _secret_key:
-        st.markdown('''
-        <div style="background:rgba(34,197,94,.10);border:1px solid rgba(34,197,94,.3);
-                    border-radius:8px;padding:10px 12px;font-family:'Space Mono',monospace;
-                    font-size:0.68rem;color:#22c55e;">
-            ✓ Clé GCV chargée depuis st.secrets
-        </div>''', unsafe_allow_html=True)
-        gcv_api_key = _secret_key
-    else:
-        gcv_api_key = st.text_input("Clé API Google Cloud Vision", value=st.session_state.get("gcv_api_key",""),
-                                     type="password", placeholder="AIza…",
-                                     help="Clé API Google Cloud Vision pour OCR des PDF.\nAjoutez GCV_API_KEY dans vos st.secrets.")
-        st.session_state["gcv_api_key"] = gcv_api_key
-
-    if not gcv_api_key:
-        st.markdown('''
-        <div style="font-family:'Space Mono',monospace;font-size:0.65rem;
-                    color:#5a6580;line-height:1.8;margin-top:6px;">
-            Clé requise pour les PDF Qonto/vectoriels.<br>
-            console.cloud.google.com<br>
-            → Activer <i>Cloud Vision API</i><br>
-            → Identifiants → Créer une clé API
-        </div>''', unsafe_allow_html=True)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("""
-    <div class="sb-section">
-        <div class="sb-title">📋 Formats Supportés</div>
-        <div style="font-size:0.70rem;color:#8896b0;line-height:2.2;">
-            📄 <b style="color:#e2e8f8;">PDF texte</b> — relevés numériques<br>
-            🖼️ <b style="color:#e2e8f8;">PDF vectoriel</b> — Qonto, Revolut, N26<br>
-            🖼️ <b style="color:#e2e8f8;">PDF scanné</b> — relevés image<br>
-            📊 <b style="color:#e2e8f8;">CSV Qonto</b> — export natif recommandé<br>
-            📊 <b style="color:#e2e8f8;">CSV</b> — autres exports bancaires<br>
-            📗 <b style="color:#e2e8f8;">XLSX / XLS</b> — exports Excel<br>
-            ✏️ <b style="color:#e2e8f8;">Saisie manuelle</b> — sans fichier<br>
-            <br>
-            <span style="color:#4f8ef7;">✓</span> Odoo 12–17 · OFX SGML v1.5.1<br>
-            <span style="color:#4f8ef7;">✓</span> 16 banques FR pré-configurées<br>
-            <span style="color:#00d4aa;">✓ [v3.2]</span> PDF vectoriel via pdf2image+GCV
+    gcv_col1, gcv_col2 = st.columns([2, 3])
+    with gcv_col1:
+        if _secret_key:
+            st.markdown('<div class="key-ok">✓ Clé GCV chargée depuis st.secrets</div>', unsafe_allow_html=True)
+            gcv_api_key = _secret_key
+        else:
+            gcv_api_key = st.text_input("Clé API Google Cloud Vision", value=st.session_state.get("gcv_api_key",""),
+                                         type="password", placeholder="AIzaSy…",
+                                         help="Nécessaire pour les PDF vectoriels (Qonto, Revolut, N26…)")
+            st.session_state["gcv_api_key"] = gcv_api_key
+    with gcv_col2:
+        st.markdown(f"""
+        <div style="background:rgba(59,91,219,0.05);border:1px solid var(--border);border-radius:10px;
+                    padding:10px 14px;font-family:'DM Mono',monospace;font-size:0.68rem;color:var(--muted2);line-height:2.0;">
+            <b style="color:var(--text2);">PDF vectoriels supportés :</b> Qonto · Revolut · N26 · Orange Bank<br>
+            Sans clé → PDF texte traités normalement · CSV Qonto recommandé<br>
+            <a href="https://console.cloud.google.com" target="_blank" style="color:var(--accent);">console.cloud.google.com</a>
+            → Activer <i>Cloud Vision API</i> → Identifiants → Créer clé API
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # LAYOUT PRINCIPAL
@@ -887,17 +1103,22 @@ with st.sidebar:
 col_main, col_right = st.columns([3, 2], gap="large")
 
 with col_main:
+
+    # ── Étape 1 : Upload ─────────────────────────────────────────────────────
     st.markdown("""
     <div class="step-card">
         <div class="step-header">
             <div class="step-num">1</div>
-            <div class="step-title">Importer votre relevé bancaire</div>
+            <div>
+                <div class="step-title">Importer votre relevé bancaire</div>
+                <div class="step-desc">PDF · CSV · XLSX · XLS — jusqu'à 25 MB</div>
+            </div>
         </div>
     </div>
     """, unsafe_allow_html=True)
 
-    uploaded_file = st.file_uploader("Glissez-déposez ou cliquez · PDF, CSV, XLSX, XLS",
-                                      type=["pdf","csv","xlsx","xls"], label_visibility="visible")
+    uploaded_file = st.file_uploader("Glissez-déposez ou cliquez",
+                                      type=["pdf","csv","xlsx","xls"], label_visibility="collapsed")
 
     if uploaded_file:
         size_mb = uploaded_file.size / (1024 * 1024)
@@ -910,11 +1131,11 @@ with col_main:
         ext_icons = {"pdf":"📄","csv":"📊","xlsx":"📗","xls":"📗"}
 
         st.markdown(f"""
-        <div style="display:flex;align-items:center;gap:12px;margin:10px 0 16px 0;flex-wrap:wrap;">
+        <div style="display:flex;align-items:center;gap:10px;margin:10px 0 16px;flex-wrap:wrap;">
             <span class="pill pill-ok">✓ Fichier chargé</span>
             <span class="pill pill-info">{ext_icons.get(ext,'📁')} {ext.upper()}</span>
-            <span style="font-size:0.70rem;color:var(--muted2);">{uploaded_file.name}</span>
-            <span style="font-size:0.70rem;color:var(--muted);">{size_kb:.1f} KB</span>
+            <span style="font-size:0.72rem;color:var(--text2);font-family:'Sora',sans-serif;">{uploaded_file.name}</span>
+            <span style="font-size:0.70rem;color:var(--muted);font-family:'DM Mono',monospace;">{size_kb:.1f} KB</span>
         </div>
         """, unsafe_allow_html=True)
 
@@ -923,10 +1144,10 @@ with col_main:
             raw_for_sheets = _read_bytes(uploaded_file)
             sheets = get_excel_sheets(raw_for_sheets)
             if len(sheets) > 1:
-                selected_sheet = st.selectbox(f"📋 Feuille Excel ({len(sheets)} feuilles détectées) :", sheets)
+                selected_sheet = st.selectbox(f"📋 Feuille Excel ({len(sheets)} feuilles) :", sheets)
             elif sheets: selected_sheet = sheets[0]
 
-        # ── Auto-retry si clé GCV vient d'être saisie ──────────────────────
+        # Auto-retry si clé GCV vient d'être saisie
         _gcv_key_changed = (
             gcv_api_key and
             gcv_api_key != st.session_state.get("last_gcv_key", "") and
@@ -934,19 +1155,14 @@ with col_main:
             st.session_state.get("raw_pdf_bytes") is not None
         )
         if _gcv_key_changed:
-            st.info("🔄 Clé GCV détectée — relance de l'extraction OCR…")
-            _df_retry, _method_retry = parse_pdf(BytesIO(st.session_state["raw_pdf_bytes"]),
-                                                   gcv_api_key=gcv_api_key)
-            st.session_state.df_parsed = _df_retry
-            st.session_state.parse_method = _method_retry
+            st.info("🔄 Clé GCV détectée — relance automatique…")
+            _df_r, _meth_r = parse_pdf(BytesIO(st.session_state["raw_pdf_bytes"]), gcv_api_key=gcv_api_key)
+            st.session_state.df_parsed = _df_r; st.session_state.parse_method = _meth_r
             st.session_state["last_gcv_key"] = gcv_api_key
-            if not _df_retry.empty:
-                st.success(f"✅ OCR réussi via Google Cloud Vision ({_method_retry})")
+            if not _df_r.empty:
+                st.success(f"✅ OCR réussi ({_meth_r})")
                 st.rerun()
-            else:
-                st.warning("⚠ L'OCR n'a pas produit de résultat. Vérifiez la clé GCV.")
 
-        # ── Parsing ────────────────────────────────────────────────────────
         progress_bar = st.progress(0, text="Initialisation…")
         with st.spinner(""):
             try:
@@ -961,7 +1177,7 @@ with col_main:
                     if "google-vision-ocr" in (method or ""):
                         progress_bar.progress(80, text="Google Cloud Vision OCR terminé…")
                     elif method == "failed":
-                        progress_bar.progress(80, text="⚠ Vérifiez votre clé GCV dans la sidebar")
+                        progress_bar.progress(80, text="⚠ Vérifiez votre clé GCV dans la configuration")
                     else:
                         progress_bar.progress(80, text=f"Méthode : {method}…")
                 elif ext == "csv":
@@ -973,32 +1189,26 @@ with col_main:
                     raw_xl = _read_bytes(uploaded_file)
                     df_raw = parse_excel(raw_xl, sheet_name=selected_sheet); method = "excel-parser"
                     progress_bar.progress(80, text="Nettoyage…")
-
-                st.session_state.df_parsed = df_raw
-                st.session_state.parse_method = method
+                st.session_state.df_parsed = df_raw; st.session_state.parse_method = method
                 progress_bar.progress(100, text="✓ Terminé")
             except Exception as e:
                 progress_bar.progress(100, text="❌ Erreur")
                 st.error(f"❌ Erreur lors de la lecture : {e}")
-                with st.expander("🔍 Détail de l'erreur"): st.code(traceback.format_exc())
+                with st.expander("🔍 Détail"): st.code(traceback.format_exc())
                 st.session_state.df_parsed = pd.DataFrame()
 
-        # ── Résultats parsing ─────────────────────────────────────────────
+        # Résultats
         if st.session_state.df_parsed is not None and not st.session_state.df_parsed.empty:
             df_raw = st.session_state.df_parsed
             n_rows = len(df_raw); n_cols = len(df_raw.columns)
             method = st.session_state.parse_method or "—"
-
             method_colors = {
-                "pdfplumber-tables": "pill-ok", "camelot-lattice": "pill-ok",
-                "camelot-stream": "pill-teal", "tabula": "pill-teal",
-                "pdfplumber-text": "pill-warn", "vector-geometry-engine": "pill-teal",
-                "google-vision-ocr": "pill-teal", "google-vision-ocr (Qonto)": "pill-teal",
-                "csv-parser": "pill-ok", "excel-parser": "pill-ok",
-                "failed": "pill-danger", "manual-entry": "pill-info",
+                "pdfplumber-tables":"pill-ok","camelot-lattice":"pill-ok","camelot-stream":"pill-teal",
+                "tabula":"pill-teal","pdfplumber-text":"pill-warn","vector-geometry-engine":"pill-teal",
+                "google-vision-ocr":"pill-teal","google-vision-ocr (Qonto)":"pill-teal",
+                "csv-parser":"pill-ok","excel-parser":"pill-ok","failed":"pill-danger","manual-entry":"pill-info",
             }
             m_cls = method_colors.get(method, "pill-info")
-
             st.markdown(f"""
             <div style="display:flex;align-items:center;gap:10px;margin:8px 0 16px;flex-wrap:wrap;">
                 <span class="pill {m_cls}">⚡ {method}</span>
@@ -1006,130 +1216,72 @@ with col_main:
                 <span class="pill pill-info">{n_cols} colonnes</span>
             </div>
             """, unsafe_allow_html=True)
-
             if n_rows > MAX_ROWS_WARNING:
-                st.warning(f"⚠️ {n_rows:,} lignes détectées. L'import Odoo peut être lent au-delà de 5 000 transactions.")
+                st.warning(f"⚠️ {n_rows:,} lignes — import Odoo peut être lent au-delà de 5 000 transactions.")
             if "google-vision-ocr" in method:
-                info_msg = ("🏦 Relevé **Qonto** détecté et traité via Google Cloud Vision (pdf2image + GCV)."
-                            if "Qonto" in method else
-                            "🔍 PDF traité via Google Cloud Vision (pdf2image + GCV). Vérifiez le mapping.")
-                st.info(info_msg)
-
-            with st.expander("👁️ Aperçu des données brutes (15 premières lignes)", expanded=False):
-                st.dataframe(df_raw.head(15), use_container_width=True, height=280)
+                st.info("🔍 PDF traité via Google Cloud Vision (pdf2image + GCV). Vérifiez le mapping ci-dessous.")
+            with st.expander("👁️ Aperçu données brutes (15 lignes)", expanded=False):
+                st.dataframe(df_raw.head(15), use_container_width=True, height=260)
 
         elif st.session_state.df_parsed is not None and st.session_state.df_parsed.empty:
             method_failed = st.session_state.get("parse_method") == "failed"
             is_pdf = uploaded_file is not None and uploaded_file.name.upper().endswith(".PDF")
-
             if method_failed and is_pdf:
                 st.markdown("""
-                <div style="background:rgba(255,75,75,0.1);border:1px solid #ff4b4b;border-radius:10px;padding:20px;margin-bottom:20px;">
-                    <h3 style="color:#ff4b4b;margin-top:0;">❌ Extraction impossible (PDF Vectoriel)</h3>
-                    <p>Ce PDF dessine les lettres en vecteurs (Qonto, Revolut, N26…). L'extraction directe a échoué.</p>
-                    <p style="font-size:0.9em;color:#888;">
-                        💡 <b>Solution :</b> Renseignez votre clé <b>Google Cloud Vision</b> dans la sidebar
-                        (section 🔍 OCR), puis cliquez sur <b>🔄 Relancer l'OCR</b> ci-dessous.
-                    </p>
+                <div style="background:rgba(201,42,42,0.06);border:1px solid rgba(201,42,42,0.2);border-radius:14px;padding:20px;margin-bottom:16px;">
+                    <b style="color:#c92a2a;">❌ Extraction impossible — PDF Vectoriel</b><br>
+                    <span style="font-size:0.85em;color:var(--text2);">Ce PDF dessine les lettres en vecteurs (Qonto, Revolut, N26…).
+                    Renseignez votre clé Google Cloud Vision dans la <b>Configuration</b> ci-dessus, puis cliquez sur Relancer l'OCR.</span>
                 </div>
                 """, unsafe_allow_html=True)
-
-                tab_gcv, tab_csv, tab_manual = st.tabs([
-                    "🔑 Option 1 — Google Vision (Recommandé)",
-                    "📊 Option 2 — Export CSV",
-                    "✏️ Option 3 — Saisie manuelle",
-                ])
-
+                tab_gcv, tab_csv, tab_manual = st.tabs(["🔑 Google Vision","📊 Export CSV","✏️ Saisie manuelle"])
                 with tab_gcv:
-                    _current_key = gcv_api_key or st.session_state.get("gcv_api_key","")
-                    _has_raw = st.session_state.get("raw_pdf_bytes") is not None
-
-                    if _current_key and _has_raw:
-                        st.markdown("""
-                        <div style="background:rgba(0,212,170,.08);border:1px solid rgba(0,212,170,.25);
-                                    border-radius:10px;padding:14px 16px;margin-bottom:12px;
-                                    font-family:'Space Mono',monospace;font-size:0.72rem;color:var(--accent2);">
-                            ✓ Clé GCV disponible — cliquez pour relancer l'OCR (pdf2image + Google Vision).
-                        </div>
-                        """, unsafe_allow_html=True)
+                    _cur_key = gcv_api_key or st.session_state.get("gcv_api_key","")
+                    if _cur_key and st.session_state.get("raw_pdf_bytes"):
+                        st.markdown('<div class="key-ok" style="margin-bottom:12px;">✓ Clé GCV disponible — prêt pour l\'OCR</div>', unsafe_allow_html=True)
                         if st.button("🔄 Relancer l'OCR avec Google Cloud Vision", use_container_width=True, key="retry_gcv_btn"):
                             with st.spinner("🔍 pdf2image + Google Cloud Vision en cours…"):
-                                _df_r, _meth_r = parse_pdf(BytesIO(st.session_state["raw_pdf_bytes"]),
-                                                            gcv_api_key=_current_key)
-                            st.session_state.df_parsed = _df_r
-                            st.session_state.parse_method = _meth_r
-                            st.session_state["last_gcv_key"] = _current_key
+                                _df_r, _meth_r = parse_pdf(BytesIO(st.session_state["raw_pdf_bytes"]), gcv_api_key=_cur_key)
+                            st.session_state.df_parsed = _df_r; st.session_state.parse_method = _meth_r
+                            st.session_state["last_gcv_key"] = _cur_key
                             if not _df_r.empty:
                                 st.success(f"✅ OCR réussi — {len(_df_r)} lignes extraites")
                                 st.rerun()
                             else:
-                                st.error("❌ L'OCR n'a pas produit de résultat. Vérifiez votre clé GCV.")
+                                st.error("❌ OCR sans résultat. Vérifiez la clé GCV.")
                     else:
-                        st.markdown("""
-                        <div style="background:var(--card2);border:1px solid var(--border2);
-                                    border-radius:10px;padding:16px 18px;font-family:'Space Mono',monospace;
-                                    font-size:0.72rem;color:var(--muted2);line-height:2.0;">
-                            <b style="color:var(--text);">Renseignez votre clé Google Cloud Vision</b>
-                            dans la barre latérale (🔍 OCR — PDF) :<br><br>
-                            <b style="color:var(--accent);">1.</b> <a href="https://console.cloud.google.com" target="_blank"
-                               style="color:var(--accent);">console.cloud.google.com</a><br>
-                            <b style="color:var(--accent);">2.</b> Activer <i>Cloud Vision API</i><br>
-                            <b style="color:var(--accent);">3.</b> Identifiants → Créer une clé API (gratuit jusqu'à 1 000 req/mois)<br>
-                            <b style="color:var(--accent);">4.</b> Coller dans la sidebar → le bouton 🔄 apparaît ici<br>
-                            <br>
-                            <b>Ou via st.secrets (Streamlit Cloud) :</b><br>
-                            <code>GCV_API_KEY = "AIza..."</code>
-                        </div>
-                        """, unsafe_allow_html=True)
-
+                        st.info("Renseignez la clé Google Cloud Vision dans la **Configuration** en haut de page.")
                 with tab_csv:
                     st.markdown("""
-                    <div style="background:var(--card2);border:1px solid var(--border2);
-                                border-radius:10px;padding:16px 18px;font-family:'Space Mono',monospace;
-                                font-size:0.72rem;color:var(--muted2);line-height:2.0;">
-                        <b style="color:var(--text);">Export CSV natif Qonto</b> — aucune clé API requise :<br><br>
-                        <b style="color:var(--accent2);">1.</b> Connectez-vous sur <i>app.qonto.com</i><br>
-                        <b style="color:var(--accent2);">2.</b> Menu <b>Compte</b> → <b>Relevés</b><br>
-                        <b style="color:var(--accent2);">3.</b> Cliquer sur <b>Exporter</b> → choisir <b>CSV</b><br>
-                        <b style="color:var(--accent2);">4.</b> Télécharger le CSV et l'importer ici<br><br>
-                        <span style="color:var(--success);">✓ Format pris en charge nativement — mapping automatique</span>
+                    <div style="font-family:'DM Mono',monospace;font-size:0.72rem;color:var(--text2);line-height:2.0;">
+                        <b>Qonto :</b> app.qonto.com → Compte → Relevés → Exporter CSV<br>
+                        <b>Revolut :</b> App Revolut → Compte → Relevé → Export CSV<br>
+                        <b>N26 :</b> app.n26.com → Transactions → Exporter CSV<br>
+                        <span style="color:var(--success);">✓ Format CSV pris en charge nativement</span>
                     </div>
                     """, unsafe_allow_html=True)
-
                 with tab_manual:
-                    st.markdown("""
-                    <div style="font-family:'Space Mono',monospace;font-size:0.72rem;
-                                color:var(--muted2);margin-bottom:12px;">
-                        Saisissez vos transactions manuellement :<br>
-                        <code style="color:var(--accent2);">DD/MM/YYYY ; Libellé ; Montant</code>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    manual_text = st.text_area("Transactions (une par ligne)",
-                        placeholder="01/06/2025 ; Qonto - Abonnement ; -70.80\n17/06/2025 ; URSSAF ILE DE FRANCE ; -339.00\n25/06/2025 ; GIE KLESIA COTIS ; -72.33",
-                        height=200, key="manual_txn_input")
-                    if st.button("📥 Charger les transactions", use_container_width=True):
+                    manual_text = st.text_area("Transactions (DD/MM/YYYY ; Libellé ; Montant)",
+                        placeholder="01/06/2025 ; Qonto - Abonnement ; -70.80\n17/06/2025 ; URSSAF ; -339.00",
+                        height=180, key="manual_txn_input")
+                    if st.button("📥 Charger", use_container_width=True):
                         rows = []
                         for line in manual_text.strip().split("\n"):
                             line = line.strip()
                             if not line: continue
                             parts = re.split(r"[;,\t]", line, maxsplit=2)
                             parts = [p.strip() for p in parts]
-                            if len(parts) >= 3:
-                                rows.append({"date": parts[0], "libellé": parts[1], "montant": parts[2], "memo": parts[1]})
-                            elif len(parts) == 2:
-                                rows.append({"date": parts[0], "libellé": parts[1], "montant": "0", "memo": parts[1]})
+                            if len(parts) >= 3: rows.append({"date":parts[0],"libellé":parts[1],"montant":parts[2],"memo":parts[1]})
+                            elif len(parts) == 2: rows.append({"date":parts[0],"libellé":parts[1],"montant":"0","memo":parts[1]})
                         if rows:
-                            df_manual = pd.DataFrame(rows)
-                            st.session_state.df_parsed = df_manual
-                            st.session_state.parse_method = "manual-entry"
+                            st.session_state.df_parsed = pd.DataFrame(rows); st.session_state.parse_method = "manual-entry"
                             st.success(f"✅ {len(rows)} transaction(s) chargée(s).")
                             st.rerun()
-                        else:
-                            st.warning("⚠️ Aucune ligne valide. Format : Date ; Libellé ; Montant")
+                        else: st.warning("⚠️ Format : Date ; Libellé ; Montant")
             else:
                 st.error("❌ Aucune donnée extraite. Vérifiez le format du fichier.")
 
-    # ── ÉTAPE 2 : Mapping ─────────────────────────────────────────────────────
+    # ── Étape 2 : Mapping ────────────────────────────────────────────────────
     if st.session_state.df_parsed is not None and not st.session_state.df_parsed.empty:
         df = st.session_state.df_parsed
         mapping = auto_map_columns(df)
@@ -1140,7 +1292,10 @@ with col_main:
         <div class="step-card" style="margin-top:20px;">
             <div class="step-header">
                 <div class="step-num">2</div>
-                <div class="step-title">Mapper les colonnes</div>
+                <div>
+                    <div class="step-title">Mapper les colonnes</div>
+                    <div class="step-desc">Association automatique détectée — vérifiez et ajustez si nécessaire</div>
+                </div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -1148,10 +1303,10 @@ with col_main:
         auto_mapped = [f for f, v in mapping.items() if v is not None]
         if auto_mapped:
             st.markdown(f"""
-            <div style="margin-bottom:14px;">
+            <div style="margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
                 <span class="pill pill-teal">🎯 Auto-mapping</span>
-                <span style="font-size:0.70rem;color:var(--muted2);margin-left:8px;">
-                    {len(auto_mapped)} colonne(s) : {', '.join(auto_mapped)}
+                <span style="font-size:0.72rem;color:var(--text2);font-family:'Sora',sans-serif;">
+                    {len(auto_mapped)} colonne(s) détectée(s) : {', '.join(auto_mapped)}
                 </span>
             </div>
             """, unsafe_allow_html=True)
@@ -1162,29 +1317,23 @@ with col_main:
 
         c1, c2 = st.columns(2)
         with c1:
-            col_date = _sel("📅 DATE *", "col_date", none_list+cols,
-                            mapping["date"] if mapping["date"] else NONE_OPT)
-            col_name = _sel("🏷️ LIBELLÉ", "col_name", none_list+cols,
-                            mapping["name"] if mapping["name"] else NONE_OPT)
+            col_date = _sel("📅 DATE *", "col_date", none_list+cols, mapping["date"] if mapping["date"] else NONE_OPT)
+            col_name = _sel("🏷️ LIBELLÉ", "col_name", none_list+cols, mapping["name"] if mapping["name"] else NONE_OPT)
         with c2:
-            col_amount = _sel("💶 MONTANT *", "col_amount", none_list+cols,
-                              mapping["amount"] if mapping["amount"] else NONE_OPT)
-            col_memo = _sel("📝 MEMO (optionnel)", "col_memo", none_list+cols,
-                            mapping["memo"] if mapping["memo"] else NONE_OPT)
+            col_amount = _sel("💶 MONTANT *", "col_amount", none_list+cols, mapping["amount"] if mapping["amount"] else NONE_OPT)
+            col_memo = _sel("📝 MEMO (optionnel)", "col_memo", none_list+cols, mapping["memo"] if mapping["memo"] else NONE_OPT)
 
         use_split = st.checkbox("🔀 Colonnes DÉBIT / CRÉDIT séparées", value=False)
         col_debit = NONE_OPT; col_credit = NONE_OPT
         if use_split:
             cs1, cs2 = st.columns(2)
-            with cs1: col_debit = _sel("➖ DÉBIT","col_debit",none_list+cols,
-                                        mapping["debit"] if mapping["debit"] else NONE_OPT)
-            with cs2: col_credit = _sel("➕ CRÉDIT","col_credit",none_list+cols,
-                                         mapping["credit"] if mapping["credit"] else NONE_OPT)
+            with cs1: col_debit = _sel("➖ DÉBIT","col_debit",none_list+cols, mapping["debit"] if mapping["debit"] else NONE_OPT)
+            with cs2: col_credit = _sel("➕ CRÉDIT","col_credit",none_list+cols, mapping["credit"] if mapping["credit"] else NONE_OPT)
             if col_debit != NONE_OPT and col_credit != NONE_OPT and col_debit == col_credit:
-                st.warning("⚠️ Les colonnes DÉBIT et CRÉDIT doivent être différentes.")
+                st.warning("⚠️ DÉBIT et CRÉDIT doivent être des colonnes différentes.")
 
         if col_date != NONE_OPT:
-            with st.expander("🔬 Prévisualisation du parsing (5 premières lignes)", expanded=False):
+            with st.expander("🔬 Prévisualisation parsing (5 premières lignes)", expanded=False):
                 preview_cols = {"date": col_date}
                 if not use_split and col_amount != NONE_OPT: preview_cols["montant"] = col_amount
                 if use_split:
@@ -1198,22 +1347,19 @@ with col_main:
                 if not preview_df.empty:
                     if "montant" in preview_df.columns:
                         preview_df["montant_parsé"] = preview_df["montant"].apply(amount_to_float)
-                    elif "débit" in preview_df.columns or "crédit" in preview_df.columns:
-                        d_col = preview_df.get("débit", pd.Series([0]*5))
-                        c_col = preview_df.get("crédit", pd.Series([0]*5))
-                        preview_df["montant_parsé"] = (
-                            d_col.apply(lambda x: -abs(amount_to_float(x)) if amount_to_float(x) != 0 else 0)
-                            + c_col.apply(lambda x: abs(amount_to_float(x))))
                     if "date" in preview_df.columns:
                         preview_df["date_OFX"] = preview_df["date"].apply(format_ofx_date)
                     st.dataframe(preview_df, use_container_width=True)
 
-        # ── ÉTAPE 3 : Génération ──────────────────────────────────────────────
+        # ── Étape 3 : Génération ──────────────────────────────────────────────
         st.markdown("""
         <div class="step-card" style="margin-top:20px;">
             <div class="step-header">
                 <div class="step-num">3</div>
-                <div class="step-title">Générer le fichier OFX</div>
+                <div>
+                    <div class="step-title">Générer le fichier OFX</div>
+                    <div class="step-desc">Conversion vers le format OFX SGML v1.5.1 compatible Odoo</div>
+                </div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -1223,8 +1369,7 @@ with col_main:
         ready = col_date != NONE_OPT and amount_ok
 
         if not ready:
-            st.markdown('<span class="pill pill-warn">⚠️ Mappez au minimum la DATE et le MONTANT</span>',
-                        unsafe_allow_html=True)
+            st.markdown('<span class="pill pill-warn">⚠️ Mappez au minimum la DATE et le MONTANT</span>', unsafe_allow_html=True)
 
         if st.button("⚡ Générer le fichier OFX", disabled=not ready, type="primary", use_container_width=True):
             with st.spinner("🔧 Génération OFX en cours…"):
@@ -1237,10 +1382,8 @@ with col_main:
                             + df[col_credit].apply(lambda x: abs(amount_to_float(x))))
                     else:
                         txn_df["amount"] = df[col_amount].apply(amount_to_float)
-                    txn_df["name"] = (df[col_name].fillna("TRANSACTION").astype(str)
-                                      if col_name != NONE_OPT else "TRANSACTION")
-                    txn_df["memo"] = (df[col_memo].fillna("").astype(str)
-                                      if col_memo != NONE_OPT else "")
+                    txn_df["name"] = df[col_name].fillna("TRANSACTION").astype(str) if col_name != NONE_OPT else "TRANSACTION"
+                    txn_df["memo"] = df[col_memo].fillna("").astype(str) if col_memo != NONE_OPT else ""
                     mask_date = txn_df["date"].notna() & (txn_df["date"].astype(str).str.strip() != "")
                     mask_amount = txn_df["amount"] != 0.0
                     txn_df = txn_df[mask_date & mask_amount].reset_index(drop=True)
@@ -1251,14 +1394,12 @@ with col_main:
                                             account_type=account_type, currency=currency,
                                             language=language, opening_balance=opening_bal)
                         fname = f"{ofx_filename_input.strip() or 'transactions_odoo'}.ofx"
-                        st.session_state.ofx_content = ofx_str
-                        st.session_state.ofx_filename = fname
-                        st.session_state.downloaded = False
-                        st.session_state.file_deleted = False
+                        st.session_state.ofx_content = ofx_str; st.session_state.ofx_filename = fname
+                        st.session_state.downloaded = False; st.session_state.file_deleted = False
                         st.success(f"✅ {len(txn_df):,} transactions converties avec succès !")
                 except Exception as e:
-                    st.error(f"❌ Erreur de génération : {e}")
-                    with st.expander("🔍 Détail de l'erreur"): st.code(traceback.format_exc())
+                    st.error(f"❌ Erreur : {e}")
+                    with st.expander("🔍 Détail"): st.code(traceback.format_exc())
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # COLONNE DROITE
@@ -1266,7 +1407,6 @@ with col_main:
 with col_right:
     if st.session_state.ofx_content and not st.session_state.file_deleted:
         ofx = st.session_state.ofx_content
-        lines_ofx = ofx.split("\n")
         txn_count = ofx.count("<STMTTRN>")
         debit_count = ofx.count("<TRNTYPE>DEBIT</TRNTYPE>")
         credit_count = ofx.count("<TRNTYPE>CREDIT</TRNTYPE>")
@@ -1283,16 +1423,15 @@ with col_right:
         """, unsafe_allow_html=True)
 
         tab_prev, tab_valid = st.tabs(["📄 Aperçu OFX","✅ Validation"])
-
         with tab_prev:
-            preview_lines = lines_ofx[:80]
+            lines_ofx = ofx.split("\n")
             preview_html = ""
-            for line in preview_lines:
+            for line in lines_ofx[:80]:
                 esc = line.replace("&","&amp;").replace("<","§L§").replace(">","§G§")
                 esc = esc.replace("§L§","<span class='ofx-tag'>&lt;").replace("§G§","&gt;</span>")
                 preview_html += f"<div>{esc}</div>"
             if len(lines_ofx) > 80:
-                preview_html += f"<div style='color:var(--muted);margin-top:8px;'>… +{len(lines_ofx)-80} lignes</div>"
+                preview_html += f"<div style='color:#5c6490;margin-top:8px;'>… +{len(lines_ofx)-80} lignes</div>"
             st.markdown(f'<div class="ofx-preview">{preview_html}</div>', unsafe_allow_html=True)
 
         with tab_valid:
@@ -1302,64 +1441,53 @@ with col_right:
             rows_html = "".join(
                 f'<div class="validation-row"><span class="v-icon {cls[l]}">{icons[l]}</span><span>{m}</span></div>'
                 for l, m in checks)
-            all_ok = all(l=="ok" for l,_ in checks)
-            has_err = any(l=="err" for l,_ in checks)
+            all_ok = all(l=="ok" for l,_ in checks); has_err = any(l=="err" for l,_ in checks)
             summary_cls = "pill-ok" if all_ok else ("pill-danger" if has_err else "pill-warn")
             summary_txt = "OFX valide" if all_ok else ("Erreurs détectées" if has_err else "Avertissements")
             st.markdown(f"""
-            <div style="margin-bottom:14px;"><span class="pill {summary_cls}">{summary_txt}</span></div>
-            <div style="background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:14px 16px;">{rows_html}</div>
+            <div style="margin-bottom:12px;"><span class="pill {summary_cls}">{summary_txt}</span></div>
+            <div style="background:var(--card2);border:1px solid var(--border);border-radius:12px;padding:14px 16px;">{rows_html}</div>
             """, unsafe_allow_html=True)
 
         st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-        st.markdown('<div style="font-family:\'Space Mono\',monospace;font-size:0.65rem;color:var(--muted);letter-spacing:0.08em;text-transform:uppercase;margin-bottom:8px;">// Téléchargement</div>',
-                    unsafe_allow_html=True)
-
-        def _mark_downloaded(): st.session_state.downloaded = True
-
         st.download_button(
             label=f"⬇️  Télécharger {st.session_state.ofx_filename}",
             data=st.session_state.ofx_content.encode("utf-8"),
             file_name=st.session_state.ofx_filename,
             mime="application/x-ofx",
             use_container_width=True,
-            on_click=_mark_downloaded,
+            on_click=lambda: setattr(st.session_state, 'downloaded', True),
         )
         ofx_size = len(st.session_state.ofx_content.encode("utf-8"))
         st.markdown(f"""
-        <div style="text-align:center;margin-top:8px;font-family:'Space Mono',monospace;font-size:0.65rem;color:var(--muted);">
+        <div style="text-align:center;margin-top:8px;font-family:'DM Mono',monospace;font-size:0.65rem;color:var(--muted);">
             {ofx_size/1024:.1f} KB · UTF-8 · OFX SGML v1.5.1
         </div>
         """, unsafe_allow_html=True)
 
         if st.session_state.downloaded:
             st.markdown("""
-            <div style="background:rgba(239,68,68,.07);border:1px solid rgba(239,68,68,.2);
-                        border-radius:10px;padding:14px 16px;margin-top:16px;">
-                <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:700;
-                            font-size:0.78rem;color:#f87171;margin-bottom:4px;">⚠️ Session active</div>
-                <div style="font-family:'Space Mono',monospace;font-size:0.68rem;color:var(--muted);margin-bottom:10px;">
-                    Le fichier a été téléchargé. Supprimez les données de session si nécessaire.
+            <div style="background:rgba(230,119,0,0.08);border:1px solid rgba(230,119,0,0.2);
+                        border-radius:12px;padding:14px 16px;margin-top:16px;">
+                <div style="font-family:'Sora',sans-serif;font-weight:700;font-size:0.80rem;color:#e67700;margin-bottom:4px;">⚠️ Fichier téléchargé</div>
+                <div style="font-family:'DM Mono',monospace;font-size:0.68rem;color:var(--muted);">
+                    Supprimez les données de session pour effacer le fichier de la mémoire.
                 </div>
             </div>
             """, unsafe_allow_html=True)
             if st.button("🗑️ Effacer la session", use_container_width=True):
                 for k in ("ofx_content","ofx_filename","df_parsed","parse_method","raw_pdf_bytes","raw_pdf_name","last_gcv_key"):
                     st.session_state[k] = None
-                st.session_state.downloaded = False
-                st.session_state.file_deleted = True
+                st.session_state.downloaded = False; st.session_state.file_deleted = True
                 st.rerun()
 
     elif st.session_state.file_deleted:
         st.markdown("""
-        <div style="background:rgba(34,197,94,.07);border:1px solid rgba(34,197,94,.2);
-                    border-radius:14px;padding:40px;text-align:center;margin-top:20px;">
+        <div style="background:rgba(9,146,104,0.06);border:1px solid rgba(9,146,104,0.2);
+                    border-radius:16px;padding:40px;text-align:center;margin-top:20px;">
             <div style="font-size:3rem;margin-bottom:12px;">🗑️</div>
-            <div style="font-family:'Bricolage Grotesque',sans-serif;font-weight:700;
-                        color:var(--success);font-size:1rem;margin-bottom:6px;">Session effacée</div>
-            <div style="font-family:'Space Mono',monospace;font-size:0.68rem;color:var(--muted);">
-                Le fichier OFX a été supprimé de la mémoire de session.
-            </div>
+            <div style="font-family:'Sora',sans-serif;font-weight:700;color:var(--success);font-size:1rem;margin-bottom:6px;">Session effacée</div>
+            <div style="font-family:'DM Mono',monospace;font-size:0.68rem;color:var(--muted);">Le fichier OFX a été supprimé de la mémoire.</div>
         </div>
         """, unsafe_allow_html=True)
     else:
@@ -1369,8 +1497,8 @@ with col_right:
             <div class="no-data-title">En attente de génération</div>
             <div class="no-data-sub">
                 Importez un relevé PDF, CSV ou Excel<br>
-                mappez les colonnes, puis cliquez sur<br>
-                <span style="color:var(--accent);">⚡ Générer le fichier OFX</span>
+                mappez les colonnes, puis cliquez sur<br><br>
+                <span style="color:var(--accent);font-weight:600;">⚡ Générer le fichier OFX</span>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -1378,10 +1506,9 @@ with col_right:
 st.markdown("<br><hr>", unsafe_allow_html=True)
 st.markdown("""
 <div class="ofx-footer">
-    OFX Converter for ODOO v3.2 &nbsp;·&nbsp;
+    OFX Converter for Odoo v4.0 &nbsp;·&nbsp;
     <span style="color:var(--accent);">Développé par Achraf BEN YOUNES</span>
-    &nbsp;·&nbsp; Compatible Odoo 12–17
-    &nbsp;·&nbsp; OFX SGML v1.5.1
-    &nbsp;·&nbsp; Moteurs : pdfplumber · camelot · tabula · pdf2image · Google Vision OCR
+    &nbsp;·&nbsp; 🇫🇷 France · 🇧🇪 Belgique · 🇨🇭 Suisse · 🇹🇳 Tunisie
+    &nbsp;·&nbsp; pdf2image · Google Vision OCR
 </div>
 """, unsafe_allow_html=True)
