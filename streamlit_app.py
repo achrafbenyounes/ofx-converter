@@ -1111,26 +1111,192 @@ def _find_excel_header(df: pd.DataFrame) -> pd.DataFrame:
     return new_df.reset_index(drop=True)
 
 def auto_map_columns(df: pd.DataFrame) -> dict:
-    mapping = {k: None for k in ("date","amount","debit","credit","name","memo")}
-    kw_map = {
-        "date":   ["date de valeur","date de l'opération","date opération","date operation","date valeur",
-                   "dateop","date d'opération","date comptable","date","jour","day","dt","datum","buchungsdatum","valutadatum"],
-        "debit":  ["débit","debit","retrait","withdrawal","sortie","montant débit","montant debit","dépense","depense","ausgabe","lastschrift","belastung"],
-        "credit": ["crédit","credit","versement","deposit","entrée","entree","montant crédit","montant credit","recette","gutschrift","eingang"],
-        "amount": ["montant (eur)","montant (chf)","montant (tnd)","montant (usd)","montant_brut","montant","amount","somme","sum","trnamt",
-                   "value","total","net","prix","betrag","saldo"],
-        "name":   ["libellé opération","libellé","libelle","label","description","transactions","intitulé","intitule",
-                   "référence","reference","nom","name","communication","motif opération","wording","buchungstext","verwendungszweck"],
-        "memo":   ["note","catégorie","categorie","memo","motif","objet","détail","detail","commentaire","complément","complement","information","mitteilung"],
+    """
+    Auto-mapping intelligent par scoring pondéré multi-critères.
+
+    Pour chaque champ cible (date, amount, debit, credit, name, memo),
+    chaque colonne reçoit un score basé sur :
+      1. Correspondance EXACTE du nom de colonne          → +100 pts
+      2. Mot-clé HIGH PRIORITY contenu dans le nom        → +50 pts
+      3. Mot-clé MEDIUM PRIORITY                          → +25 pts
+      4. Mot-clé LOW PRIORITY                             → +10 pts
+      5. Analyse du CONTENU des cellules (dates, montants) → +20 à +40 pts
+      6. Exclusion explicite                               → -100 pts
+
+    La colonne avec le score le plus élevé gagne pour chaque champ
+    (score minimum > 0 requis). Contrainte d'unicité : chaque colonne
+    ne peut être assignée qu'à un seul champ.
+
+    Couverture : France (BNP, SG, CA, LCL, CE, Boursorama, Qonto…),
+                 Belgique (KBC, ING, Belfius…), Suisse (UBS, PostFinance…),
+                 Tunisie (BIAT, STB…), + Revolut, N26, Wise, Bunq…
+    """
+    FIELD_RULES = {
+        "date": {
+            "exact":   ["date", "datum", "date opération", "date operation", "dateop",
+                        "operation_date", "started date", "date de comptabilisation",
+                        "buchungsdatum", "date comptable", "date d'opération"],
+            "high":    ["date", "buchungsdatum", "dateop", "operation_date", "started date",
+                        "date de comp", "date op"],
+            "medium":  ["valeur", "dateVal", "value_date", "completed date", "datum",
+                        "valutadatum", "comptab"],
+            "low":     ["jour", "day", "dt"],
+            "exclude": ["solde", "balance", "saldo", "amount", "montant", "betrag",
+                        "bedrag", "betrag", "credit", "debit", "devise", "currency"],
+        },
+        "amount": {
+            "exact":   ["montant", "amount", "betrag", "bedrag", "trnamt",
+                        "montant (eur)", "montant (chf)", "montant (tnd)", "montant (usd)",
+                        "amount (eur)", "amount (chf)", "montant de l'opération",
+                        "montant_brut", "mnt"],
+            "high":    ["montant", "amount", "betrag", "bedrag", "mnt"],
+            "medium":  ["somme", "sum", "total", "net", "prix", "value", "valeur"],
+            "low":     [],
+            "exclude": ["solde", "balance", "saldo", "running balance", "devise",
+                        "currency", "valuta", "debit", "credit", "débit", "crédit",
+                        "gutschrift", "belastung", "fee", "frais"],
+        },
+        "debit": {
+            "exact":   ["débit", "debit", "belastung", "lastschrift",
+                        "montant débit", "montant debit", "débit euro", "debit euro",
+                        "ausgaben", "ausgabe"],
+            "high":    ["débit", "debit", "belastung"],
+            "medium":  ["retrait", "withdrawal", "sortie", "ausgabe", "expense", "dépense"],
+            "low":     [],
+            "exclude": ["crédit", "credit", "gutschrift", "eingang", "solde", "balance"],
+        },
+        "credit": {
+            "exact":   ["crédit", "credit", "gutschrift", "eingang",
+                        "montant crédit", "crédit euro", "credit euro",
+                        "einnahmen", "einnahme"],
+            "high":    ["crédit", "credit", "gutschrift", "eingang"],
+            "medium":  ["versement", "deposit", "entrée", "entree", "recette"],
+            "low":     [],
+            "exclude": ["débit", "debit", "belastung", "lastschrift", "solde", "balance"],
+        },
+        "name": {
+            "exact":   ["libellé", "libelle", "label", "description", "payee",
+                        "buchungstext", "omschrijving", "transactions",
+                        "libellé opération", "libelle operation", "opération", "operation",
+                        "wording", "payment reference", "verwendungszweck"],
+            "high":    ["libellé", "libelle", "label", "payee", "buchungstext",
+                        "omschrijving", "description", "wording", "opération"],
+            "medium":  ["intitulé", "intitule", "référence", "reference", "nom", "name",
+                        "communication", "motif", "verwendungszweck", "payment ref",
+                        "transaction type", "type"],
+            "low":     ["text", "texte", "détail"],
+            "exclude": ["date", "datum", "montant", "amount", "betrag", "bedrag",
+                        "débit", "crédit", "solde", "balance", "devise", "currency",
+                        "iban", "bic", "account", "numero"],
+        },
+        "memo": {
+            "exact":   ["memo", "note", "catégorie", "categorie", "category",
+                        "complément", "complement", "mitteilung", "attachment_ids",
+                        "payment_reference"],
+            "high":    ["memo", "note", "category", "catégorie", "mitteilung"],
+            "medium":  ["objet", "détail", "detail", "commentaire", "information",
+                        "attachment", "reference", "motif", "note interne"],
+            "low":     ["payment_reference", "remarque", "remark"],
+            "exclude": ["date", "datum", "montant", "amount", "libellé", "label",
+                        "débit", "crédit", "solde", "balance", "devise"],
+        },
     }
-    cols_lower = {c.lower().strip(): c for c in df.columns}
+
+    def _score(col_name: str, field: str, series) -> float:
+        rules = FIELD_RULES[field]
+        cl = col_name.lower().strip()
+        score = 0.0
+
+        # Exclusions absolues
+        if any(ex in cl for ex in rules["exclude"]):
+            return -100.0
+
+        # Exact match
+        if cl in rules["exact"]:
+            score += 100.0
+
+        # High priority keyword
+        for kw in rules["high"]:
+            if kw in cl:
+                score += 50.0
+                break
+
+        # Medium priority keyword
+        for kw in rules["medium"]:
+            if kw in cl:
+                score += 25.0
+                break
+
+        # Low priority keyword
+        for kw in rules["low"]:
+            if kw in cl:
+                score += 10.0
+                break
+
+        # ── Analyse du contenu des cellules ────────────────────────────────
+        if series is not None and score >= 0:
+            try:
+                sample = [str(v).strip() for v in series.dropna().head(30)
+                          if str(v).strip() not in ("", "nan", "None")][:25]
+                n = len(sample)
+                if n > 0:
+                    if field == "date":
+                        date_re = re.compile(
+                            r'\d{1,2}[/\-\.]\d{1,2}([/\-\.]\d{2,4})?'
+                            r'|\d{4}[/\-\.]\d{1,2}[/\-\.]\d{1,2}'
+                            r'|\d{8}')
+                        ratio = sum(1 for s in sample if date_re.search(s)) / n
+                        score += 40.0 if ratio > 0.7 else (20.0 if ratio > 0.4 else 0)
+
+                    elif field == "amount":
+                        num_re = re.compile(r'^[+\-]?\s*[\d\s]+[.,]\d+\s*$|^[+\-]?\s*\d+\s*$')
+                        cleaned = [re.sub(r'[€$£\sCHFEURUSDGBPTNDMAD]', '', s) for s in sample]
+                        ratio = sum(1 for s in cleaned if num_re.match(s) and s) / n
+                        score += 35.0 if ratio > 0.6 else (15.0 if ratio > 0.3 else 0)
+
+                    elif field in ("debit", "credit"):
+                        num_re = re.compile(r'^[\d\s.,]+$')
+                        cleaned = [re.sub(r'[€$£\sCHFEURUSDGBPTNDMAD]', '', s) for s in sample]
+                        num_ratio = sum(1 for s in cleaned if num_re.match(s) and s) / n
+                        empty_ratio = series.isna().mean() + (series.astype(str).str.strip() == "").mean()
+                        if num_ratio > 0.5: score += 20.0
+                        if empty_ratio > 0.3: score += 15.0  # colonnes avec vides = débit/crédit séparés
+
+                    elif field == "name":
+                        text_re = re.compile(r'[a-zA-ZÀ-ÿ]{3,}')
+                        ratio = sum(1 for s in sample if text_re.search(s)) / n
+                        score += 25.0 if ratio > 0.7 else (10.0 if ratio > 0.4 else 0)
+            except Exception:
+                pass
+
+        return score
+
+    cols = list(df.columns)
+    mapping = {k: None for k in ("date", "amount", "debit", "credit", "name", "memo")}
+
+    # Calculer tous les scores
+    all_scores = {}
+    for col in cols:
+        series = df[col] if col in df.columns else None
+        all_scores[col] = {field: _score(col, field, series) for field in mapping}
+
+    # Attribuer par ordre de priorité décroissant (champs les plus discriminants en premier)
+    field_priority = ["date", "amount", "name", "debit", "credit", "memo"]
     used = set()
-    for field, keywords in kw_map.items():
-        for kw in keywords:
-            for col_l, col_o in cols_lower.items():
-                if kw in col_l and col_o not in used:
-                    mapping[field] = col_o; used.add(col_o); break
-            if mapping[field]: break
+
+    for field in field_priority:
+        best_col, best_score = None, 0.0
+        for col in cols:
+            if col in used:
+                continue
+            s = all_scores[col][field]
+            if s > best_score:
+                best_score = s
+                best_col = col
+        if best_col:
+            mapping[field] = best_col
+            used.add(best_col)
+
     return mapping
 
 def validate_ofx(ofx_str: str) -> list:
@@ -1461,14 +1627,29 @@ with col_main:
         </div>
         """, unsafe_allow_html=True)
 
-        auto_mapped = [f for f, v in mapping.items() if v is not None]
+        auto_mapped = [(f, v) for f, v in mapping.items() if v is not None]
         if auto_mapped:
+            field_icons = {
+                "date": "📅", "amount": "💶", "debit": "➖",
+                "credit": "➕", "name": "🏷️", "memo": "📝"
+            }
+            chips = "".join(
+                f'<span style="display:inline-flex;align-items:center;gap:4px;'
+                f'background:rgba(12,166,120,.08);border:1px solid rgba(12,166,120,.2);'
+                f'border-radius:8px;padding:4px 10px;font-family:\'DM Mono\',monospace;'
+                f'font-size:0.68rem;color:var(--accent2);">'
+                f'{field_icons.get(f,"·")} <b>{f}</b> → {v}</span>'
+                for f, v in auto_mapped
+            )
             st.markdown(f"""
-            <div style="margin-bottom:14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;">
-                <span class="pill pill-teal">🎯 Auto-mapping</span>
-                <span style="font-size:0.72rem;color:var(--text2);font-family:'Sora',sans-serif;">
-                    {len(auto_mapped)} colonne(s) détectée(s) : {', '.join(auto_mapped)}
-                </span>
+            <div style="margin-bottom:16px;">
+                <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap;">
+                    <span class="pill pill-teal">🎯 Auto-mapping intelligent</span>
+                    <span style="font-size:0.70rem;color:var(--muted2);font-family:'DM Mono',monospace;">
+                        {len(auto_mapped)} / {len(mapping)} champs détectés automatiquement
+                    </span>
+                </div>
+                <div style="display:flex;flex-wrap:wrap;gap:6px;">{chips}</div>
             </div>
             """, unsafe_allow_html=True)
 
