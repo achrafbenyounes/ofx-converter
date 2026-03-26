@@ -77,6 +77,16 @@ def clean_text(text: str) -> str:
     return re.sub(r"\n+", "\n", text)
 
 
+def rib_to_iban(rib_23: str) -> str:
+    """
+    Convertit un RIB français (23 chiffres) en IBAN FR (27 chars).
+    Algorithme standard : chiffres_rib + "152700" (FR=1527, 00) modulo 97.
+    """
+    numeric = rib_23 + "152700"
+    check = 98 - (int(numeric) % 97)
+    return f"FR{check:02d}{rib_23}"
+
+
 def is_amount_word(s: str) -> bool:
     return bool(re.match(r"^\d{1,4}[,\.]\d{2}$", s.strip()))
 
@@ -113,7 +123,12 @@ def detect_bank(text: str) -> str:
         return "BNP_PARIBAS"
     if "CREDIT AGRICOLE" in t or "CRÉDIT AGRICOLE" in t:
         return "CREDIT_AGRICOLE"
-    if "SOCIETE GENERALE" in t or "SOCIÉTÉ GÉNÉRALE" in t:
+    # SG : pdfplumber fusionne les mots → "SociétéGénérale" ou "SOCIETEGENERALE"
+    if ("SOCIETE GENERALE" in t or "SOCIÉTÉ GÉNÉRALE" in t
+            or "SOCIETEGENERALE" in t or "SOCIÉTÉGÉNÉRALE" in t
+            or "SOCGEN.COM" in t or "SOCGEN" in t
+            or ("CTC INDEXE TAUX BASE SG" in t)
+            or ("PROFESSIONNELS.SG.FR" in t)):
         return "SOCIETE_GENERALE"
     if re.search(r"CREDIT\s*MUTUEL|CRÉDIT\s*MUTUEL", t):
         return "CREDIT_MUTUEL"
@@ -150,6 +165,8 @@ def detect_bank(text: str) -> str:
 
 def extract_iban_bic(text: str) -> tuple[str | None, str | None]:
     iban, bic = None, None
+
+    # ── 1. IBAN standard (FR76 … 27 chars) ──
     m = re.search(
         r"\bFR\d{2}"
         r"(?:\s*[0-9A-Z]{4}){5}"
@@ -163,6 +180,19 @@ def extract_iban_bic(text: str) -> tuple[str | None, str | None]:
         if 14 <= len(candidate) <= 34:
             iban = candidate
 
+    # ── 2. RIB Société Générale : "n°30003039840002030717348" (23 chiffres collés)
+    #       ou "n° 30003 03984 00020307173 48" (avec espaces) ──
+    if iban is None:
+        m = re.search(
+            r"n[°o]\s*(\d{5})\s*(\d{5})\s*(\d{11})\s*(\d{2})",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            rib_23 = "".join(m.groups())  # 5+5+11+2 = 23 chiffres
+            iban = rib_to_iban(rib_23)
+
+    # ── 3. BIC ──
     m = re.search(r"\b[A-Z]{4}FR[A-Z0-9]{2}(?:[A-Z0-9]{3})?\b", text)
     if m:
         bic = m.group()
@@ -179,6 +209,9 @@ def extract_iban_bic(text: str) -> tuple[str | None, str | None]:
 _AMT = r"([\+\-]?\s*€?\s*\d[\d\s\xa0]*(?:\.\d{3})*[,\.]\d{2})"
 
 _OPENING_PATTERNS = [
+    # ── BNP Paribas : ligne "+ 3 351,28  Débit : 20 118,38  + 496,17"
+    #    Le solde d'ouverture précède "Débit :" sur cette ligne ──
+    r"([\+\-]?\s*\d[\d\s\xa0]*[,\.]\d{2})\s+D[ée]bit\s*:",
     # ── BNP Paribas : "Solde au 30 NOVEMBRE : + 3 351,28" ──
     r"[Ss]olde\s+au\s+\d+\s+[A-ZÉÈÊA-Za-zéèêàâùûîô]{3,}\s*[:\n]?\s*" + _AMT,
     # ── La Banque Postale ──
@@ -188,8 +221,10 @@ _OPENING_PATTERNS = [
     r"[Aa]ncien\s+solde\s*:?\s*" + _AMT,
     # ── Crédit Agricole : "Ancien solde créditeur au 31.12.2025 104,81" ──
     r"[Aa]ncien\s+solde\s+cr[ée]diteur\s+au\s+[\d\.\/\-]+\s*" + _AMT,
-    # ── SG : "SOLDE PRÉCÉDENT AU 30/09/2025 4.908,86" ──
+    # ── SG : "SOLDE PRÉCÉDENT AU 30/09/2025 4.908,86" (normal) ──
     r"SOLDE\s+PR[EÉ]C[EÉ]DENT\s+AU\s+\d{2}/\d{2}/\d{4}\s*" + _AMT,
+    # ── SG compact (pdfplumber fusionne les mots) : "SOLDEPRÉCÉDENTAU30/09/2025 4.908,86" ──
+    r"SOLDEPR[EÉ]C[EÉ]DENTAU\d{2}/\d{2}/\d{4}\s*" + _AMT,
     # ── Qonto : Solde au DD/MM ──
     r"[Ss]olde\s+au\s+\d{2}/\d{2}\s+" + _AMT,
     r"[Ss]olde\s+au\s+\d{2}/\d{2}\s*\n\s*" + _AMT,
@@ -214,6 +249,14 @@ _OPENING_PATTERNS = [
 ]
 
 _CLOSING_PATTERNS = [
+    # ── BNP Paribas : "Solde créditeur au 31.12.2025 + 496,17" ──
+    r"[Ss]olde\s+cr[ée]diteur\s+au\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,
+    # ── BNP pdfplumber (pas d'espaces) : "Soldecréditeurau31.12.2025 496,17" ──
+    r"Soldecr[ée]diteurau\d{2}\.\d{2}\.\d{4}\s*" + _AMT,
+    # ── Société Générale : "NOUVEAU SOLDE AU 31/10/2025 + 3.014,95" (normal) ──
+    r"NOUVEAU\s+SOLDE\s+AU\s+\d{2}/\d{2}/\d{4}\s*" + _AMT,
+    # ── SG compact (pdfplumber) : "NOUVEAUSOLDEAU31/10/2025 +3.014,95" ──
+    r"NOUVEAUSOLDEAU\d{2}/\d{2}/\d{4}\s*" + _AMT,
     # ── BNP Paribas : 2ème occurrence "Solde au 31 DÉCEMBRE" ──
     r"[Ss]olde\s+au\s+\d+\s+[A-ZÉÈÊA-Za-zéèêàâùûîô]{3,}\s*[:\n]?\s*" + _AMT,
     r"[Nn]ouveau\s+solde\s+au\s+[\d/]+\s*" + _AMT,
@@ -251,6 +294,10 @@ def extract_closing_balance(text: str) -> float | None:
         r"[Ss]olde\s+au\s+\d+\s+[A-ZÉÈÊA-Za-zéèêàâùûîô]{3,}\s*[:\n]?\s*" + _AMT,
         # CIC / Crédit Mutuel : "SOLDE CREDITEUR AU 02/02/2026 44.317,80"
         r"SOLDE\s+CR[EÉ]DITEUR\s+AU\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,
+        # BNP Paribas : "Solde créditeur au 31.12.2025 496,17"
+        r"[Ss]olde\s+cr[ée]diteur\s+au\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,
+        # BNP pdfplumber (pas d'espaces) : "Soldecréditeurau31.12.2025 496,17"
+        r"Soldecr[ée]diteurau\d{2}\.\d{2}\.\d{4}\s*" + _AMT,
     ]
     for pat in multi_patterns:
         matches = re.findall(pat, text, re.IGNORECASE | re.MULTILINE)
@@ -274,10 +321,30 @@ def extract_closing_balance(text: str) -> float | None:
 
 def parse_revolut_text(text: str) -> pd.DataFrame:
     """
-    Revolut Business — format anglais.
-    Table : Date (UTC) | Description | Money out | Money in | Balance
-    Dates  : DD Mon YYYY  (ex : 28 Feb 2026)
-    Signe  : déterminé par l'évolution du solde colonne Balance.
+    Revolut Business — format anglais, v3 (basé sur analyse pdfplumber réelle).
+
+    Structure constatée après extraction pdfplumber :
+    ─────────────────────────────────────────────────────────────────────────
+    Ligne 1 (transaction) : DD Mon YYYY  TYPE  Description…  €MONTANT  €SOLDE
+    Ligne 2+ (optionnel)  : suite de la description OU "Fee: €X.XX"
+                            OU ligne de pied de page (ignorée)
+    ─────────────────────────────────────────────────────────────────────────
+
+    Règles d'extraction :
+      • Les montants (€MONTANT + €SOLDE) sont TOUJOURS sur la ligne 1.
+      • €MONTANT = avant-dernier montant de la ligne 1.
+      • €SOLDE   = dernier  montant de la ligne 1.
+      • Le code type détermine le signe (jamais de signe sur les montants) :
+            MOA (Money Added)   → Money in  → crédit (+)
+            MOR (Money Received)→ Money in  → crédit (+)
+            EXI (Exchange In)   → Money in  → crédit (+)
+            MOS (Money Sent)    → Money out → débit  (-)
+            CAR (Card payment)  → Money out → débit  (-)
+            FEE (Revolut Fees)  → Money out → débit  (-)
+            ATM (ATM)           → Money out → débit  (-)
+            EXO (Exchange Out)  → Money out → débit  (-)
+      • Revolut liste les transactions du plus récent au plus ancien
+        → on inverse pour obtenir l'ordre chronologique.
     """
     MONTHS = {
         "Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04",
@@ -285,65 +352,171 @@ def parse_revolut_text(text: str) -> pd.DataFrame:
         "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12",
     }
 
-    # Solde d'ouverture
-    m = re.search(r"[Oo]pening\s+[Bb]alance\s+€\s*([\d\s,\.]+)", text)
-    opening = clean_amount(m.group(1)) if m else None
+    # ── Codes type → signe ──
+    CREDIT_TYPES = {"MOA", "MOR", "EXI"}
+    DEBIT_TYPES  = {"MOS", "CAR", "FEE", "ATM", "EXO"}
 
-    date_re = re.compile(
-        r"^(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\s*(.*)"
+    # ── Lignes de pied de page à ignorer dans les continuations ──
+    _FOOTER = re.compile(
+        r"^(?:Report\s+lost|Get\s+help|Scan\s+the|Revolut\s+Bank\s+UAB\s+is"
+        r"|©\s*20\d{2}|\+370|\"Ind[eė]|www\.iidraudimas|\d{1,2}/\d{1,2}$"
+        r"|but\s+some\s+exceptions|avenue\s+Kl[eé]ber|08130\s+Vilnius)",
+        re.IGNORECASE,
     )
 
-    rows: list[dict] = []
-    for line in text.split("\n"):
-        line = line.strip()
+    # ── Solde d'ouverture (Balance summary) ──
+    m = re.search(r"Opening\s+balance\s+€([\d\s,\.]+)", text, re.IGNORECASE)
+    opening = clean_amount(m.group(1)) if m else None
+
+    # ── Solde de clôture ──
+    m2 = re.search(r"Closing\s+balance\s+€([\d\s,\.]+)", text, re.IGNORECASE)
+    closing = clean_amount(m2.group(1)) if m2 else None
+
+    date_re = re.compile(
+        r"^(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+        r"\s+(\d{4})\s+([A-Z]{2,4})\s+(.+)"
+    )
+
+    # ── Regex pour extraire €MONTANT €SOLDE en fin de ligne 1 ──
+    # Format Revolut : €X XXX.XX (séparateur milliers = espace)
+    _AMT_RE = re.compile(r"€([\d][\d\s]*\.\d{2})")
+
+    # ─────────────────────────────────────────────────────────────
+    # 1. GROUPER les lignes en blocs (un bloc = une transaction)
+    # ─────────────────────────────────────────────────────────────
+    blocks: list[dict] = []
+    current: dict | None = None
+
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        # Arrêt propre à la section "Transaction types" (pied du relevé)
+        if re.match(r"^Transaction\s+types", line, re.IGNORECASE):
+            if current is not None:
+                blocks.append(current)
+                current = None
+            break
+
         dm = date_re.match(line)
-        if not dm:
-            continue
-        day, mon_str, yr, rest = dm.groups()
-        date_str = f"{day.zfill(2)}/{MONTHS.get(mon_str, '01')}/{yr}"
+        if dm:
+            if current is not None:
+                blocks.append(current)
+            day, mon_str, yr = dm.group(1), dm.group(2), dm.group(3)
+            date_str = f"{day.zfill(2)}/{MONTHS[mon_str]}/{yr}"
+            current = {
+                "date":      date_str,
+                "type_code": dm.group(4),
+                "line1":     line,          # ligne complète avec montants
+                "desc_extra": [],           # lignes de continuation (description)
+            }
+        elif current is not None:
+            # Ignorer les pieds de page
+            if _FOOTER.match(line):
+                continue
+            # Ignorer les lignes "Fee: €X.XX" (info uniquement, montant déjà inclus)
+            if re.match(r"^Fee\s*:\s*€", line, re.IGNORECASE):
+                continue
+            # Ignorer les lignes ne contenant que des chiffres/symboles
+            if not re.search(r"[A-Za-zÀ-ÿ]", line):
+                continue
+            current["desc_extra"].append(line)
 
-        # Tous les montants €XX.XX ou €X,XXX.XX sur la ligne
-        euros = re.findall(r"€\s*([\d\s,\.]+)", rest)
-        amounts = [clean_amount(e) for e in euros]
-        amounts = [a for a in amounts if a is not None and a > 0]
+    if current is not None:
+        blocks.append(current)
 
-        if len(amounts) < 2:
-            continue
-
-        balance = amounts[-1]
-        transaction_amt = amounts[-2]  # avant le solde = montant de la transaction
-
-        # Description : enlever les montants €
-        desc = re.sub(r"€[\d\s,\.]+", "", rest)
-        desc = re.sub(r"^\s*\w{2,4}\s+", "", desc.strip())  # enlever code type ex "MOS"
-        desc = re.sub(r"\s{2,}", " ", desc).strip()[:120]
-
-        rows.append({
-            "date": date_str,
-            "libelle": desc,
-            "transaction_amt": transaction_amt,
-            "balance": balance,
-        })
-
-    if not rows:
+    if not blocks:
         return pd.DataFrame(columns=["date", "libelle", "montant"])
 
-    # Revolut affiche du plus récent au plus ancien → renverser
-    rows_chrono = list(reversed(rows))
-    prev_bal = opening if opening is not None else 0.0
+    # ─────────────────────────────────────────────────────────────
+    # 2. PARSER chaque bloc
+    # ─────────────────────────────────────────────────────────────
     transactions: list[dict] = []
 
-    for row in rows_chrono:
-        delta = row["balance"] - prev_bal
-        montant = abs(row["transaction_amt"]) if delta >= 0 else -abs(row["transaction_amt"])
-        prev_bal = row["balance"]
+    for block in blocks:
+        type_code = block["type_code"]
+        line1     = block["line1"]
+
+        # ── Extraire les montants de la ligne 1 (€X XXX.XX format Revolut) ──
+        raw_amts = _AMT_RE.findall(line1)
+        amounts  = [clean_amount(a) for a in raw_amts]
+        amounts  = [a for a in amounts if a is not None and a > 0]
+
+        if len(amounts) < 2:
+            # Fallback : chercher tout nombre décimal X.XX en fin de ligne
+            raw_amts = re.findall(r"([\d][\d ]*\.\d{2})", line1)
+            amounts  = [clean_amount(a) for a in raw_amts]
+            amounts  = [a for a in amounts if a is not None and 0 < a < 1_000_000]
+
+        if len(amounts) < 2:
+            continue  # ligne non parsable
+
+        balance         = amounts[-1]   # SOLDE (dernier)
+        transaction_amt = amounts[-2]   # MONTANT de l'opération (avant-dernier)
+
+        # ── Signe : 100 % déterminé par le code type ──
+        if type_code in CREDIT_TYPES:
+            montant = +abs(transaction_amt)   # Money in → crédit
+        elif type_code in DEBIT_TYPES:
+            montant = -abs(transaction_amt)   # Money out → débit
+        else:
+            # Code inconnu → débit par prudence (très rare)
+            montant = -abs(transaction_amt)
+
+        # ── Description ──
+        # Supprimer "DD Mon YYYY  TYPE_CODE  " du début
+        desc = re.sub(
+            r"^\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+            r"\s+\d{4}\s+[A-Z]{2,4}\s+",
+            "",
+            line1,
+            flags=re.IGNORECASE,
+        )
+        # Supprimer les montants €X.XX en fin (y compris avec séparateur espace milliers)
+        desc = re.sub(r"\s*€[\d][\d\s]*\.\d{2}", "", desc).strip()
+
+        # Ajouter les lignes de continuation (suite de description, max 2)
+        for extra in block["desc_extra"][:2]:
+            desc = desc + " " + extra.strip()
+
+        desc = re.sub(r"\s{2,}", " ", desc).strip()[:120]
+
         transactions.append({
-            "date": row["date"],
-            "libelle": row["libelle"],
+            "date":    block["date"],
+            "libelle": desc,
             "montant": round(montant, 2),
+            "balance": balance,           # conservé pour vérification
         })
 
-    df = pd.DataFrame(transactions)
+    if not transactions:
+        return pd.DataFrame(columns=["date", "libelle", "montant"])
+
+    # ── Revolut liste du plus récent au plus ancien → inverser ──
+    transactions.reverse()
+
+    # ─────────────────────────────────────────────────────────────
+    # 3. VÉRIFICATION des soldes (détection d'anomalies)
+    # ─────────────────────────────────────────────────────────────
+    # On vérifie que balance[n] ≈ balance[n-1] + montant[n]
+    # Si anomalie → on tente de corriger le signe (code type inconnu uniquement)
+    prev_bal = opening if opening is not None else None
+
+    for tx in transactions:
+        if prev_bal is not None:
+            expected = round(prev_bal + tx["montant"], 2)
+            actual   = tx["balance"]
+            # Si écart > 0.05 € ET le code type est inconnu → inverser le signe
+            if abs(expected - actual) > 0.05:
+                inverted = round(-tx["montant"], 2)
+                if abs(round(prev_bal + inverted, 2) - actual) < 0.05:
+                    tx["montant"] = inverted  # correction du signe
+        prev_bal = tx["balance"]
+
+    df = pd.DataFrame([
+        {"date": t["date"], "libelle": t["libelle"], "montant": t["montant"]}
+        for t in transactions
+    ])
     df["montant"] = df["montant"].round(2)
     return df
 
@@ -582,8 +755,379 @@ def parse_caisse_epargne_text(text: str) -> pd.DataFrame:
 
 
 # =========================================================
-# PARSER TEXTE UNIVERSEL — Qonto + fallback OCR
+# PARSER TEXTE BNP PARIBAS
 # =========================================================
+
+def parse_bnp_paribas_text(text: str, year: str | None = None) -> pd.DataFrame:
+    """
+    BNP Paribas — relevé de compte courant.
+
+    pdfplumber compacte les mots (supprime les espaces inter-colonnes),
+    donnant par exemple "PAIEMENTSPARCARTES" au lieu de "PAIEMENTS PAR CARTES".
+
+    Structure : sections avec en-tête déterminant le signe CRÉDIT (+) ou DÉBIT (-) :
+      Crédit : REMISESDESPECES · REMISESDECARTES · VIREMENTSRECUS
+      Débit  : PAIEMENTSPARCARTES · VIREMENTSEMIS · PRELEVEMENTS ·
+               AUTRESOPERATIONSDEBIT
+
+    Format de chaque ligne de transaction :
+      DD.MM.YY  DESCRIPTION  DD.MM.YY  MONTANT
+      (date comptable, libellé, date valeur, montant en FR : virgule décimale)
+
+    Le montant est TOUJOURS le dernier token de la ligne de date,
+    au format français : \d{1,3}(?:\s\d{3})*,\d{2}  (max 3 chiffres par groupe).
+    """
+    if year is None:
+        ym = re.search(r"(20\d{2})", text)
+        year = ym.group(1) if ym else str(datetime.now().year)
+
+    # ── En-têtes de section : avec ou sans espaces (pdfplumber supprime les espaces) ──
+    _CREDIT_HDR = re.compile(
+        r"^REMISES?\s*D.?\s*ESPECES?$|^REMISES?\s*D.?\s*ESPECES?\s+|"
+        r"^REMISESDESPECES|^REMISESDECARTES|^REMISESDE\s*CARTES?|"
+        r"^REMISES?\s*DE\s*CARTES?$|^VIREMENTSRECUS?$|^VIREMENTS?\s*RE[CÇ]US?$",
+        re.IGNORECASE,
+    )
+    _DEBIT_HDR = re.compile(
+        r"^PAIEMENTSPARCARTES?|^PAIEMENTS?\s*PAR\s*CARTES?|"
+        r"^VIREMENTSEMIS$|^VIREMENTS?\s*[EÉ]MIS$|"
+        r"^PRELEVEMENTS?[,\s]|^PR[EÉ]L[EÈ]VEMENTS?[,\s]|"
+        r"^AUTRESOPERATIONSDEBIT|^AUTRES\s*OP[EÉ]RATIONS?\s*DEBIT",
+        re.IGNORECASE,
+    )
+
+    # ── Lignes à ignorer ──
+    _SKIP = re.compile(
+        r"(^Sous[\s\-]?total|^SOUSTOTAL"
+        r"|^DATE\s*COMPTABLE|^NATUREDESOPERATIONS|^DATEDE$|^DEBIT$|^CREDIT$"
+        r"|^RELEVE|^RELEVEDEVOTRECOMPTE"
+        r"|^SAS\s*SHR$|^SOCIETE\s*EN\s*COURS|^ARGENTEUIL|^RIB\s*:"
+        r"|^IBAN\s*:\s*FR|^BIC\s*:\s*BNP"
+        r"|^PERIODE\s*DU|^Raison\s*sociale"
+        r"|^BNP\s*PARIBAS\s*SA|^P\.\s*\d+/\d+|^\d{9,}\s*$"
+        r"|^SORPSITSPREPFC|^600720"
+        r"|^Votre\s*charg|^www\.|^3478\s*\("
+        r"|^ituation\s*[Pp]ro|^-\s*CARTE\s*N|^CARTEN°"
+        r"|TOTALDESO|TOTALDESOP|SOLDE\s*CREDITEUR|Soldecréditeur"
+        r"|Rappel\s*:\s*votre)",
+        re.IGNORECASE,
+    )
+
+    # ── Pattern montant BNP : virgule décimale obligatoire (format FR) ──
+    # Deux branches :
+    #   1. \d{1,3}(?:\s\d{3})+ → groupage milliers avec espaces (ex : "1 945,00", "10 955,19")
+    #   2. \d+                  → montant sans espace         (ex : "1945,00", "77,00")
+    # La branche 2 est greedy → "1945,00" donne "1945" et non "945" (3 chiffres).
+    # Pour "161225 77,00" : "161225" n'est pas suivi d'une virgule → seul "77,00" matche.
+    _AMT_BNP = re.compile(r"((?:\d{1,3}(?:\s\d{3})+|\d+),\d{2})(?!\d)")
+
+    # ── Date comptable DD.MM.YY(YY) en tête de ligne ──
+    _DATE_START = re.compile(r"^(\d{2}\.\d{2}\.(?:\d{2}|\d{4}))\s*(.*)")
+
+    def _norm_date(raw: str) -> str:
+        p = raw.split(".")
+        if len(p) == 3:
+            y2 = "20" + p[2] if len(p[2]) == 2 else p[2]
+            return f"{p[0]}/{p[1]}/{y2}"
+        return raw
+
+    def _extract_last_amount(s: str) -> float | None:
+        """
+        Extrait le DERNIER montant BNP (format virgule) de la chaîne.
+        Retire d'abord la date valeur pour éviter les ambiguïtés.
+        """
+        # Supprimer date valeur DD.MM.YY / DD.MM.YYYY
+        s2 = re.sub(r"\b\d{2}\.\d{2}\.(?:\d{2}|\d{4})\b", " ", s)
+        matches = _AMT_BNP.findall(s2)
+        for raw in reversed(matches):
+            v = clean_amount(raw)
+            if v is not None and v > 0:
+                return round(v, 2)
+        return None
+
+    def _extract_desc(rest: str) -> str:
+        """Libellé = ligne de transaction après la date comptable, sans montant ni date valeur."""
+        s = re.sub(r"\b\d{2}\.\d{2}\.(?:\d{2}|\d{4})\b", " ", rest)
+        s = _AMT_BNP.sub(" ", s)
+        s = re.sub(r"\s{2,}", " ", s).strip()
+        return s[:120]
+
+    # ── Tronquer avant les totaux finaux ──
+    for stop_pat in [
+        r"TOTALDESO",
+        r"TOTAL\s+DES\s+OP",
+        r"Rappel\s*:\s*votre\s+num",
+        r"Soldecréditeurau\d",
+        r"Solde\s+cr[ée]diteur\s+au\s+\d{2}",
+    ]:
+        sm = re.search(stop_pat, text, re.IGNORECASE)
+        if sm:
+            text = text[: sm.start()]
+            break
+
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    transactions: list[dict] = []
+    sign = 1
+    cur_date: str | None = None
+    cur_desc: list[str] = []
+    cur_amt: float | None = None
+
+    def flush() -> None:
+        nonlocal cur_date, cur_desc, cur_amt
+        if cur_date is not None and cur_amt is not None:
+            lib = re.sub(r"\s{2,}", " ", " ".join(cur_desc)).strip()[:120]
+            transactions.append({
+                "date": cur_date,
+                "libelle": lib,
+                "montant": round(sign * cur_amt, 2),
+            })
+        cur_date = None
+        cur_desc = []
+        cur_amt = None
+
+    for line in lines:
+        # ── Changement de section ──
+        if _CREDIT_HDR.search(line) and len(line) < 60:
+            flush(); sign = 1; continue
+        if _DEBIT_HDR.search(line) and len(line) < 60:
+            flush(); sign = -1; continue
+        # ── Lignes à ignorer ──
+        if _SKIP.search(line):
+            flush(); continue
+
+        # ── Nouvelle transaction (date comptable en tête) ──
+        dm = _DATE_START.match(line)
+        if dm:
+            flush()
+            cur_date = _norm_date(dm.group(1))
+            rest = dm.group(2)
+            cur_amt = _extract_last_amount(rest)
+            desc = _extract_desc(rest)
+            cur_desc = [desc] if desc else []
+            continue
+
+        # ── Ligne de continuation ──
+        if cur_date is not None:
+            if cur_amt is None:
+                a = _extract_last_amount(line)
+                if a is not None:
+                    cur_amt = a
+                else:
+                    cur_desc.append(line)
+            else:
+                cur_desc.append(line)
+
+    flush()
+
+    if not transactions:
+        return pd.DataFrame(columns=["date", "libelle", "montant"])
+    df = pd.DataFrame(transactions)
+    df["montant"] = df["montant"].round(2)
+    return df
+
+
+
+
+def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFrame:
+    """
+    Parser texte dédié Société Générale — relevé professionnel CTC INDEXE TAUX BASE SG.
+
+    Spécificités SG :
+      • Format date : DD/MM/YYYY DD/MM/YYYY (date comptable + date valeur)
+      • Montant sur la DERNIÈRE ligne du bloc (pas toujours sur la ligne de date)
+        Ex : VIR RECU sur 4 lignes → montant isolé en dernier
+      • Deux colonnes Débit/Crédit sans signe → signe déduit par mots-clés
+      • Montants avec séparateur milliers point français : "1.426,32"
+
+    Stratégie :
+      1. Grouper les lignes en blocs (nouveau bloc = ligne commençant par DD/MM/YYYY)
+      2. Flush immédiat quand une ligne correspond à un montant autonome
+      3. Déterminer le signe (crédit/débit) par mots-clés dans tout le bloc
+    """
+    if year is None:
+        ym = re.search(r"(20\d{2})", text)
+        year = ym.group(1) if ym else str(datetime.now().year)
+
+    # Tronquer avant les lignes de totaux finaux
+    for stop in [r"TOTAUX\s+DES\s+MOUVEMENTS", r"NOUVEAU\s+SOLDE\s+AU"]:
+        sm = re.search(stop, text, re.IGNORECASE)
+        if sm:
+            text = text[: sm.start()]
+            break
+
+    # Lignes à ignorer (en-têtes, pieds de page, métadonnées SG)
+    _SKIP = re.compile(
+        r"^(Date\s+Valeur|Nature\s+de\s+l|RELEVÉ\s+DES|suite\s*>>>|Page\s+\d"
+        r"|N°\s*ADEME|Société\s+Générale|S\.A\.\s+au\s+capital|Siège\s+Social"
+        r"|29[,\s]+bd\s+Haussmann|RA\d{4,}|SOLDE\s+PR[EÉ]C[EÉ]DENT"
+        r"|RELEVÉ\s+DE\s+COMPTE|CTC\s+INDEXE|VOS\s+CONTACTS|Pour\s+toute"
+        r"|Votre\s+[Bb]anque|Votre\s+agence|Votre\s+conseiller"
+        r"|\*\s*Op[eé]ration\s+exon|552\s+120\s+222|RCS\s+Paris"
+        r"|1\s+Depuis\s+l'[eé]tranger|Depuis\s+l'[eé]tranger)",
+        re.IGNORECASE,
+    )
+
+    # Indicateurs de CRÉDIT (montant positif)
+    # Couvre : remises CB, virements reçus (EDENRED, MARKET PAY, SWILE, Deliveroo,
+    # Uber, Pluxee, UP COOP, TotalEnergies remboursement, ANCV/DRFIP…)
+    _CREDIT_RE = re.compile(
+        r"REMISE\s+CB"
+        r"|VIR\s+REC[ÇU]\b"
+        r"|REMBOURSEMENT\s+PRLV"
+        r"|CARTE.{0,25}REMBT"
+        r"|CART.{0,10}REMB"
+        r"|DE:\s*SWILE"
+        r"|DE:\s*MARKET\s+PAY"
+        r"|DE:\s*DELIVEROO"
+        r"|DE:\s*EDENRED"
+        r"|DE:\s*PLUXEE"
+        r"|DE:\s*UP\s+COOP"
+        r"|DE:\s*TREEZOR"
+        r"|DE:\s*TOTALENERGIES\s+ELEC"
+        r"|DE:\s*DRFIP"
+        r"|DE:\s*STICHTING\s+CUSTODIAN"
+        r"|DE:\s*AGENCE\s+NATIONALE"
+        r"|DE:\s*ANCV",
+        re.IGNORECASE,
+    )
+
+    # Indicateurs de DÉBIT (montant négatif)
+    _DEBIT_RE = re.compile(
+        r"CARTE\s+X\d{4}(?!\s*REMBT)"         # paiement CB (pas remboursement)
+        r"|PRELEVEMENT\s+EUROP[EÉ]EN"
+        r"|PRELEVEMENT\s+SEPA"
+        r"|VIR\s+INSTANTANE\s+EMIS"
+        r"|VIR\s+EUROP[EÉ]EN\s+EMIS"
+        r"|VIR\s+PERM\b"
+        r"|CHEQUE\b"
+        r"|CIONS\s+TENUE"
+        r"|COTIS(?:ATION)?\b"
+        r"|INT\s+D[EÉ]BITEURS",
+        re.IGNORECASE,
+    )
+
+    # Montant autonome (toute la ligne) : "149,90" ou "1.426,32" ou "16,63 *"
+    # Exclut les pourcentages (9,2500% ...) et les lignes avec texte autour
+    _AMT_LINE = re.compile(
+        r"^\s*(\d{1,3}(?:\.\d{3})*[,]\d{2})\s*\*?\s*$"
+    )
+
+    # Montant en fin de ligne (cas inline : "CARTE X3580 30/09 CARREFOUR 13,83")
+    _AMT_INLINE = re.compile(
+        r"\b(\d{1,3}(?:\.\d{3})*[,]\d{2})\s*\*?\s*$"
+    )
+
+    lines = [ln.strip() for ln in text.split("\n")]
+    transactions: list[dict] = []
+    block_lines: list[str] = []
+    block_date: str | None = None
+
+    def _determine_sign(full_text: str) -> int:
+        """Retourne +1 (crédit) ou -1 (débit) selon les mots-clés du bloc."""
+        is_credit = bool(_CREDIT_RE.search(full_text))
+        is_debit  = bool(_DEBIT_RE.search(full_text))
+        if is_credit and not is_debit:
+            return 1
+        if is_debit and not is_credit:
+            return -1
+        # Ambiguïté ou non reconnu → débit par défaut (plus sûr comptablement)
+        return -1
+
+    def _extract_amount(blines: list[str]) -> float | None:
+        """
+        Cherche le montant dans le bloc :
+          1. Dernière ligne autonome (_AMT_LINE)
+          2. Montant en fin de la première ligne (_AMT_INLINE) — transactions simples
+          3. Tout dernier token numérique \d+,\d{2} dans le bloc
+        """
+        # 1. Ligne autonome (chercher en remontant depuis la fin)
+        for ln in reversed(blines):
+            m = _AMT_LINE.match(ln)
+            if m:
+                return clean_amount(m.group(1))
+
+        # 2. Montant inline en fin de première ligne
+        if blines:
+            m = _AMT_INLINE.search(blines[0])
+            if m:
+                return clean_amount(m.group(1))
+
+        # 3. Fallback : dernier nombre décimal du bloc
+        full = " ".join(blines)
+        raw = re.findall(r"\b\d{1,3}(?:\.\d{3})*[,]\d{2}\b", full)
+        if raw:
+            return clean_amount(raw[-1])
+
+        return None
+
+    def flush_block() -> None:
+        nonlocal block_date, block_lines
+        if not block_lines or block_date is None:
+            block_date = None
+            block_lines = []
+            return
+
+        full = " ".join(block_lines)
+        amount = _extract_amount(block_lines)
+
+        if amount is not None and amount != 0:
+            sign  = _determine_sign(full)
+            montant = sign * abs(amount)
+
+            # Description : 1ère ligne sans les deux dates + éventuelles lignes 2-3
+            first = block_lines[0]
+            # Supprimer les deux dates DD/MM/YYYY en tête
+            desc_first = re.sub(r"^\d{2}/\d{2}/\d{4}\s*(?:\d{2}/\d{2}/\d{4})?\s*", "", first)
+            # Ajouter jusqu'à 2 lignes de continuation pour enrichir le libellé
+            extra = [ln for ln in block_lines[1:3] if ln and not _AMT_LINE.match(ln)]
+            desc_parts = [desc_first] + extra
+            desc = " / ".join(p.strip() for p in desc_parts if p.strip())
+            # Nettoyer : enlever le montant final inline si présent
+            desc = re.sub(r"\b\d{1,3}(?:\.\d{3})*[,]\d{2}\s*\*?\s*$", "", desc).strip()
+            desc = re.sub(r"\s{2,}", " ", desc)[:120]
+
+            transactions.append({
+                "date":    block_date,
+                "libelle": desc,
+                "montant": round(montant, 2),
+            })
+
+        block_date  = None
+        block_lines = []
+
+    for line in lines:
+        if not line or _SKIP.search(line):
+            continue
+
+        # Nouvelle transaction : ligne commençant par DD/MM/YYYY
+        date_m = re.match(r"^(\d{2}/\d{2}/\d{4})\b", line)
+        if date_m:
+            flush_block()
+            block_date  = date_m.group(1)
+            block_lines = [line]
+            # Flush immédiat si montant déjà sur la ligne de date (transaction simple)
+            if _AMT_INLINE.search(
+                re.sub(r"^\d{2}/\d{2}/\d{4}\s*(?:\d{2}/\d{2}/\d{4})?\s*", "", line)
+            ):
+                # On laisse le bloc ouvert : il sera flush au prochain bloc ou en fin de boucle
+                pass
+        elif block_date is not None:
+            # Vérifier si c'est un montant autonome (dernière ligne du bloc SG)
+            if _AMT_LINE.match(line):
+                block_lines.append(line)
+                flush_block()   # flush immédiat
+            else:
+                block_lines.append(line)
+
+    # Flush du dernier bloc
+    flush_block()
+
+    if not transactions:
+        return pd.DataFrame(columns=["date", "libelle", "montant"])
+    df = pd.DataFrame(transactions)
+    df["montant"] = df["montant"].round(2)
+    return df
+
 
 def parse_transactions_text(text: str, year: str | None = None) -> pd.DataFrame:
     """
@@ -836,6 +1380,17 @@ def parse_transactions_from_word_pages(
                     if 50 <= w["x0"] < desc_end_x
                     and not (_DATE_RE.match(w["text"]) and w["x0"] < 130)
                 )
+                # ── Société Générale & variantes : le montant peut arriver sur une
+                # ligne de continuation (ex : VIR RECU multi-lignes).
+                # On ne cherche que si aucun montant n'a encore été trouvé sur la
+                # ligne de date, pour ne pas écraser un montant déjà détecté. ──
+                if current_debit is None and current_credit is None:
+                    cont_debit  = _extract_amount_from_zone(line_words, debit_x - 35, boundary)
+                    cont_credit = _extract_amount_from_zone(line_words, boundary, 650)
+                    if cont_debit is not None:
+                        current_debit = cont_debit
+                    elif cont_credit is not None:
+                        current_credit = cont_credit
 
         flush()
 
@@ -1120,10 +1675,8 @@ def ocr_pdf_gcv(pdf_bytes: bytes) -> tuple[str, list[list[dict]]]:
 # On utilise le parser colonne (pdfplumber ou GCV word positions).
 _COLUMN_BANKS = {
     "BANQUE_POSTALE",
-    "BNP_PARIBAS",
     "CIC",
     "CREDIT_MUTUEL",
-    "SOCIETE_GENERALE",
     "CREDIT_AGRICOLE",
     "LCL",
     "GENERIC",
@@ -1131,6 +1684,7 @@ _COLUMN_BANKS = {
 
 # Banques avec parser texte dédié (montants signés ou format spécifique)
 _TEXT_BANKS = {
+    "BNP_PARIBAS": parse_bnp_paribas_text,
     "REVOLUT": parse_revolut_text,
     "SHINE": parse_shine_text,
     "BANQUE_POPULAIRE": parse_banque_populaire_text,
@@ -1150,9 +1704,10 @@ def extract_all(pdf_file) -> dict:
       2. Extraction texte (pdfplumber) OU OCR Google Vision (avec mots positionnés)
       3. Détection banque, IBAN, BIC, soldes
       4. Dispatch vers le parser approprié :
-         - Parser colonne (DÉBIT|CRÉDIT)  : La Banque Postale, BNP, CIC, CM, SG, CA, LCL
-         - Parser texte dédié             : Revolut, Shine, Banque Populaire, Caisse Épargne, Qonto
-         - Parser texte universel         : fallback générique
+         - Parser texte BNP              : BNP Paribas (sections crédit/débit)
+         - Parser texte dédié            : Revolut, Shine, Banque Populaire, Caisse Épargne, Qonto
+         - Parser colonne (DÉBIT|CRÉDIT) : La Banque Postale, CIC, CM, SG, CA, LCL
+         - Parser texte universel        : fallback générique
     """
     pdf_file.seek(0)
     pdf_bytes = pdf_file.read()
@@ -1187,7 +1742,29 @@ def extract_all(pdf_file) -> dict:
 
     # ── Dispatch parser ──
 
-    if bank in _TEXT_BANKS:
+    if bank == "SOCIETE_GENERALE":
+        # ── Société Générale — Priorité : parser texte dédié SG ──
+        # pdfplumber supprime les espaces entre mots et place le montant sur une
+        # ligne autonome → parse_societe_generale_text est le plus fiable.
+        # Le parser colonne n'est utilisé qu'en OCR (GCV) où les positions x/y sont dispo.
+        if ocr_used and pages_words:
+            # PDF scanné / image → parser colonne GCV (positions x/y)
+            df = parse_transactions_from_word_pages(
+                pages_words, year=year_ref, y_tol=4.0
+            )
+            if df.empty:
+                df = parse_societe_generale_text(raw_text, year_ref)
+        elif has_text:
+            # PDF texte natif → parser texte SG en priorité absolue
+            df = parse_societe_generale_text(raw_text, year_ref)
+            # Fallback colonne si le texte parser échoue
+            if df.empty:
+                df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
+        # Fallback universel
+        if df.empty:
+            df = parse_transactions_text(raw_text, year=year_ref)
+
+    elif bank in _TEXT_BANKS:
         # Parsers texte dédiés (signés ou format spécifique)
         parser_fn = _TEXT_BANKS[bank]
         # Passer year si la fonction l'accepte (Shine, Qonto n'en ont pas besoin)
@@ -1195,6 +1772,13 @@ def extract_all(pdf_file) -> dict:
             df = parser_fn(raw_text, year_ref)
         except TypeError:
             df = parser_fn(raw_text)
+
+        # Fallback column parser pour BNP si le texte parser échoue
+        if df.empty and bank == "BNP_PARIBAS":
+            if has_text:
+                df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
+            if df.empty:
+                df = parse_transactions_text(raw_text, year=year_ref)
 
     elif bank in _COLUMN_BANKS:
         # Parser colonne débit/crédit
