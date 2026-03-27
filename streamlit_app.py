@@ -252,6 +252,8 @@ _OPENING_PATTERNS = [
     r"[Bb]alance?\s+(?:pr[ée]c[ée]dente|initiale|d['']ouverture)\s*:?\s*" + _AMT,
     r"[Ss]olde\s+[àa]\s+la\s+date\s+du\s+\d{2}/\d{2}/\d{4}\s*:?\s*" + _AMT,
     r"SOLDE\s+EN\s+DEBUT\s+DE\s+PERIODE\s*:?\s*" + _AMT,
+    # ── Caisse d'Épargne : "SOLDE CREDITEUR AU 31/10/2025 + 5 967,83" ──
+    r"SOLDE\s+CREDITEUR\s+AU\s+\d{2}/\d{2}/\d{4}\s*" + _AMT,
     # ── Revolut Business (anglais) ──
     r"[Oo]pening\s+[Bb]alance\s*:?\s*€?\s*" + _AMT,
 ]
@@ -688,78 +690,122 @@ def parse_banque_populaire_text(text: str) -> pd.DataFrame:
 
 def parse_caisse_epargne_text(text: str) -> pd.DataFrame:
     """
-    Caisse d'Épargne — colonne MONTANT EN EUR avec signe explicite +/-.
-    Ex : "-1 800,00"  |  "+128,00"
-    Dates : DD/MM/YYYY
-    """
-    year = str(datetime.now().year)
-    m = re.search(r"\b(20\d{2})\b", text)
-    if m:
-        year = m.group(1)
+    Caisse d'Épargne — Parser natif pdfplumber (relevé mensuel PDF texte).
 
-    # Stopper aux totaux
-    for stop in [r"TOTAL DES OPERATIONS", r"Sous réserve"]:
-        sm = re.search(stop, text, re.IGNORECASE)
+    Structure constatée après extraction pdfplumber :
+    ─────────────────────────────────────────────────────────────────────────
+    Ligne 1 (transaction) : DD/MM/YYYY DD/MM/YYYY LIBELLÉ [+/-] MONTANT
+    Ligne 2+ (optionnel)  : continuation (VERS …, CONTRAT …, -Réf., etc.)
+    ─────────────────────────────────────────────────────────────────────────
+
+    Bugs corrigés (v2) :
+      1. Ne plus couper à "TOTAL DES OPERATIONS" — ce marqueur apparaît dans
+         le RÉSUMÉ D'ACTIVITÉ, AVANT le détail des opérations. L'ancien code
+         tronquait le texte avant même la première transaction.
+         → On saute désormais directement à "DETAIL DE VOS OPERATIONS".
+      2. Le montant (+/-) est TOUJOURS sur la 1ère ligne du bloc (avec les
+         deux dates). Les lignes de continuation ne contiennent pas de montant
+         décimal. L'ancien code cherchait le montant en FIN de la concaténation
+         du bloc entier → échec systématique (la dernière ligne étant du type
+         "CONTRAT 8468491 REM 185360" sans décimale).
+         → On extrait maintenant le montant de la 1ère ligne uniquement.
+
+    Format montant : "[+/-] chiffres[ chiffres],XX"
+    Exemples : "+ 128,00"  "- 1 800,00"  "- 1 758,30"  "+ 5 967,83"
+
+    Solde ouverture : "SOLDE CREDITEUR AU 31/10/2025 + 5 967,83"
+    Solde clôture   : "SOLDE CREDITEUR AU 29/11/2025 + 925,83"
+    (gérés dans extract_opening_balance / extract_closing_balance)
+    """
+    # ── 1. Sauter le résumé — partir du détail des opérations ──────────────
+    detail_m = re.search(r"DETAIL\s+DE\s+VOS\s+OPERATIONS", text, re.IGNORECASE)
+    if detail_m:
+        text = text[detail_m.start():]
+
+    # ── 2. Stopper au pied de page final (après la dernière transaction) ───
+    for stop_pat in [
+        r"Conditions\s+d.arrêté",
+        r"LA\s+CAISSE\s+D.EPARGNE\s+A\s+VOCATION",
+        r"Ce\s+document\s+ne\s+constitue\s+pas",
+    ]:
+        sm = re.search(stop_pat, text, re.IGNORECASE)
         if sm:
             text = text[: sm.start()]
+            break
 
-    transactions: list[dict] = []
-    block: list[str] = []
+    # ── 3. Regex : montant signé en FIN de 1ère ligne ─────────────────────
+    # Captures : groupe 1 = signe (+/-), groupe 2 = valeur numérique FR
+    # Ex : "- 1 800,00"  "+ 128,00"  "- 0,22"
+    _AMT_FIRST = re.compile(r"([\+\-])\s*(\d[\d\s\xa0]*[,\.]\d{2})\s*$")
 
-    _SKIP = re.compile(
-        r"DATE\s+D.OPERATION|DATE\s+DE\s+VALEUR|DETAIL|MONTANT|SYNTHESE|"
-        r"COMPTE\s+COURANT|IBAN|BIC|Page\s+\d|SOLDE\s+CREDITEUR",
-        re.IGNORECASE,
-    )
+    # ── 4. Grouper les lignes en blocs (un bloc = une transaction) ─────────
+    blocks: list[list[str]] = []
+    current_block: list[str] = []
 
-    def process_ce_block(blines: list[str]) -> dict | None:
-        full = " ".join(blines).strip()
-        dm = re.match(r"^(\d{2}/\d{2}/\d{4})", full)
-        if not dm:
-            return None
-        date_str = dm.group(1)
-
-        # Montant final avec signe +/-
-        m = re.search(r"([\+\-])\s*(\d[\d\s\xa0]*[,\.]\d{2})\s*$", full)
-        if m:
-            sign = m.group(1)
-            amount = clean_amount(m.group(2))
-            if amount is None:
-                return None
-            montant = abs(amount) if sign == "+" else -abs(amount)
-        else:
-            # Fallback : dernier montant sans signe
-            raw = re.findall(r"[\+\-]?\s*\d[\d\s\xa0]*[,\.]\d{2}", full)
-            if not raw:
-                return None
-            amount = clean_amount(raw[-1].replace("+", "").replace("-", ""))
-            if amount is None:
-                return None
-            montant = amount
-
-        # Description : enlever date opé + date valeur + montant
-        desc = full[len(date_str):]
-        desc = re.sub(r"^\s*\d{2}/\d{2}/\d{4}\s*", "", desc)  # enlever date valeur
-        desc = re.sub(r"[\+\-]?\s*\d[\d\s\xa0]*[,\.]\d{2}\s*$", "", desc).strip()[:120]
-
-        return {"date": date_str, "libelle": desc, "montant": round(montant, 2)}
-
-    for line in (ln.strip() for ln in text.split("\n")):
-        if not line or _SKIP.search(line):
+    for raw in text.split("\n"):
+        line = raw.strip()
+        if not line:
             continue
         if re.match(r"^\d{2}/\d{2}/\d{4}\b", line):
-            if block:
-                tx = process_ce_block(block)
-                if tx:
-                    transactions.append(tx)
-            block = [line]
-        elif block:
-            block.append(line)
+            if current_block:
+                blocks.append(current_block)
+            current_block = [line]
+        elif current_block:
+            current_block.append(line)
 
-    if block:
-        tx = process_ce_block(block)
-        if tx:
-            transactions.append(tx)
+    if current_block:
+        blocks.append(current_block)
+
+    # ── 5. Parser chaque bloc ──────────────────────────────────────────────
+    transactions: list[dict] = []
+
+    for block in blocks:
+        first_line = block[0]
+
+        # Date d'opération (DD/MM/YYYY)
+        dm = re.match(r"^(\d{2}/\d{2}/\d{4})", first_line)
+        if not dm:
+            continue
+        date_str = dm.group(1)
+
+        # Ignorer les lignes de solde (ouverture / clôture)
+        if re.search(r"SOLDE\s+CREDITEUR", first_line, re.IGNORECASE):
+            continue
+
+        # Montant sur la 1ère ligne (toujours présent)
+        m = _AMT_FIRST.search(first_line)
+        if not m:
+            continue
+
+        sign, raw_amount = m.group(1), m.group(2)
+        amount = clean_amount(raw_amount)
+        if amount is None:
+            continue
+        montant = abs(amount) if sign == "+" else -abs(amount)
+
+        # Description : 1ère ligne sans les 2 dates ni le montant final
+        desc = first_line[len(date_str):].strip()
+        desc = re.sub(r"^\d{2}/\d{2}/\d{4}\s*", "", desc)   # date valeur
+        desc = _AMT_FIRST.sub("", desc).strip()               # montant
+
+        # Ligne de continuation (max 1) — on ignore les refs techniques
+        for extra in block[1:2]:
+            if re.match(r"^-?R[eé]f\.|^VERS\s+\d|^CONTRAT\s+\d", extra):
+                continue
+            if re.search(
+                r"(Caisse\s+d.Epargne|directoire|75013|Nantes|perception)",
+                extra, re.IGNORECASE,
+            ):
+                continue
+            desc = (desc + " " + extra).strip()
+
+        desc = re.sub(r"\s{2,}", " ", desc)[:120]
+
+        transactions.append({
+            "date":    date_str,
+            "libelle": desc,
+            "montant": round(montant, 2),
+        })
 
     if not transactions:
         return pd.DataFrame(columns=["date", "libelle", "montant"])
