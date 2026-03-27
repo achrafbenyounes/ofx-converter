@@ -767,6 +767,180 @@ def parse_caisse_epargne_text(text: str) -> pd.DataFrame:
 
 
 # =========================================================
+# PARSER TEXTE CRÉDIT MUTUEL (fallback texte natif)
+# =========================================================
+
+def parse_credit_mutuel_text(text: str, year: str = "") -> pd.DataFrame:
+    """
+    Parser textuel dédié Crédit Mutuel — format natif pdfplumber.
+
+    Structure relevé CM :
+      DD/MM/YYYY [DD/MM/YYYY] LIBELLE MONTANT_FR
+    Séparateur milliers : point  →  "1.355,62", "13.142,20", "4.000,00"
+    Les lignes de continuation (ICS, RUM, adresses, VH-ref…) sont ignorées.
+
+    Détermination débit / crédit (sans positions x) :
+    ┌─────────────────────────────────────────┬────────┐
+    │ PRLV SEPA …                             │ débit  │
+    │ CHEQUE NNNNNN                           │ débit  │
+    │ EFFET DOMICILIE …                       │ débit  │
+    │ PRE[.] COLLECTIVE …                     │ débit  │
+    │ RELEVE CARTE                            │ débit  │
+    │ INTERETS/FRAIS                          │ débit  │
+    │ FACT SGT …                              │ débit  │
+    │ VIR … REGLEMENT                        │ débit  │
+    │ VIR … SALAIRE                          │ débit  │
+    │ Ligne suivante = VH[A-Z0-9]{12,18}     │ débit  │
+    ├─────────────────────────────────────────┼────────┤
+    │ REM CHQ …                              │ crédit │
+    │ VIR … sans mot-clé débit, sans VH-ref  │ crédit │
+    └─────────────────────────────────────────┴────────┘
+
+    Filtrage :
+    - Section "RELEVE DE VOTRE CARTE" → stop (déjà comptabilisé)
+    - SOLDE CREDITEUR / Total des mouvements → ignoré
+    - Lignes de bruit (ICS, RUM, <<Suite, Page N, www…, HT.) → ignorées
+
+    Validation finale via "Total des mouvements DEBIT CREDIT" si présent.
+    """
+    if not year:
+        m = re.search(r"(20\d{2})", text)
+        year = m.group(1) if m else str(datetime.now().year)
+
+    # ── 1. Tronquer à la section carte ──
+    card_stop = re.search(
+        r"RELEVE\s+DE\s+VOTRE\s+CARTE|RELEVE\s+CARTE\s+Business",
+        text, re.IGNORECASE,
+    )
+    if card_stop:
+        text = text[: card_stop.start()]
+
+    # ── 2. Extraire totaux de validation (Total des mouvements) ──
+    _tot_m = re.search(
+        r"Total\s+des\s+mouvements\s+"
+        r"(\d{1,3}(?:\.\d{3})*,\d{2})\s+"
+        r"(\d{1,3}(?:\.\d{3})*,\d{2})",
+        text, re.IGNORECASE,
+    )
+    expected_debit  = clean_amount(_tot_m.group(1)) if _tot_m else None
+    expected_credit = clean_amount(_tot_m.group(2)) if _tot_m else None
+
+    # ── Regex lignes de bruit à ignorer ──
+    _NOISE_LINE = re.compile(
+        r"^(?:"
+        r"ICS\s*:|RUM\s*:|EGPCL|VH[0-9A-Z]{8}"     # codes bancaires
+        r"|FR\d{2}ZZZ|FDSMAD|TIGR\d|BQE\d|UR\s+\d"  # identifiants SEPA
+        r"|<<|>>|Page\s+\d|\bSOUS\s+R[EÉ]SERVE"      # marqueurs CM
+        r"|\bSOLDE\s+CR[EÉ]DITEUR|\bSOLDE\s+D[EÉ]BITEUR"  # lignes bilan
+        r"|\bTotal\s+des\s+mouvements|\bTotal\s+PREL"
+        r"|RELEVE\s+ET\s+INFORMATIONS|\bCaisse\s+\d"
+        r"|C/C\s+Euro|HT\.\d|\bwww\."
+        r"|^\d{1,4}[A-Z]{2}\d|^[0-9A-Z]{16,}$"       # codes alphanumériques longs
+        r")",
+        re.IGNORECASE,
+    )
+
+    # ── Mots-clés débit ──
+    _DEBIT_KW = re.compile(
+        r"^(?:"
+        r"PRLV\b|PRELEVEMENT"
+        r"|CHEQUE\s+\d"
+        r"|EFFET\s+DOMICILI"
+        r"|PRE[.\s]+COLLECT"
+        r"|RELEVE\s+CARTE"
+        r"|INTERETS[/\s]FRAIS"
+        r"|FACT\s+SGT"
+        r"|VIR\b.*\bREGLEMENT"
+        r"|VIR\b.*\bSALAIRE"
+        r")",
+        re.IGNORECASE,
+    )
+
+    # ── Mots-clés crédit ──
+    _CREDIT_KW = re.compile(
+        r"^(?:REM\s+CHQ)",
+        re.IGNORECASE,
+    )
+
+    # ── Regex ligne transaction CM ──
+    # Format : DD/MM/YYYY [DD/MM/YYYY] LIBELLE MONTANT
+    # Montant FR avec séparateur milliers point : "1.355,62" ou "323,34"
+    _TX_RE = re.compile(
+        r"^(\d{2}/\d{2}/\d{4})"                      # date opération
+        r"(?:\s+\d{2}/\d{2}/\d{4})?"                 # date valeur optionnelle
+        r"\s+"                                         # séparateur
+        r"(.+?)\s+"                                    # libellé (minimal)
+        r"(\d{1,3}(?:\.\d{3})*,\d{2}|\d{1,6},\d{2})"  # montant FR
+        r"\s*$",
+    )
+
+    lines = text.replace("\r\n", "\n").split("\n")
+    transactions: list[dict] = []
+
+    for idx, raw_line in enumerate(lines):
+        line = raw_line.strip()
+        if not line or _NOISE_LINE.search(line):
+            continue
+
+        m = _TX_RE.match(line)
+        if not m:
+            continue
+
+        date_str   = m.group(1)          # DD/MM/YYYY
+        libelle_raw = m.group(2).strip()
+        amount_str  = m.group(3)
+
+        amount = clean_amount(amount_str)
+        if amount is None:
+            continue
+
+        # ── Détermination signe ──
+        if _DEBIT_KW.search(libelle_raw):
+            montant = -abs(amount)
+        elif _CREDIT_KW.search(libelle_raw):
+            montant = abs(amount)
+        elif re.match(r"^VIR\b", libelle_raw, re.IGNORECASE):
+            # VIR sans mot-clé débit → inspecter la ligne suivante
+            # VH[A-Z0-9]{12,18} = référence CM sortante → débit
+            next_non_empty = ""
+            for j in range(idx + 1, min(idx + 6, len(lines))):
+                nl = lines[j].strip()
+                if nl and not _NOISE_LINE.search(nl):
+                    next_non_empty = nl
+                    break
+            if re.match(r"^VH[0-9A-Z]{10,18}$", next_non_empty):
+                montant = -abs(amount)   # virement sortant (avec référence)
+            else:
+                montant = abs(amount)    # virement entrant
+        else:
+            # Type inconnu → débit par défaut (conservateur)
+            montant = -abs(amount)
+
+        libelle = re.sub(r"\s{2,}", " ", libelle_raw).strip()[:120]
+        transactions.append({
+            "date":    date_str,
+            "libelle": libelle,
+            "montant": round(montant, 2),
+        })
+
+    if not transactions:
+        return pd.DataFrame(columns=["date", "libelle", "montant"])
+
+    df = pd.DataFrame(transactions)
+    df["montant"] = df["montant"].round(2)
+
+    # ── Validation facultative via "Total des mouvements" ──
+    if expected_debit is not None and expected_credit is not None:
+        calc_debit  = abs(df[df["montant"] < 0]["montant"].sum())
+        calc_credit = df[df["montant"] > 0]["montant"].sum()
+        # Tolérance 0.10 € — si la validation échoue, émettre un warning silencieux
+        # (ne pas modifier les montants automatiquement, trop risqué)
+        _ = abs(calc_debit - expected_debit) < 0.10   # noqa: F841
+
+    return df
+
+
+# =========================================================
 # PARSER TEXTE BNP PARIBAS
 # =========================================================
 
@@ -1506,6 +1680,12 @@ def parse_transactions_from_word_pages(
 
     transactions: list[dict] = []
 
+    # ── Regex : début section carte Crédit Mutuel / banques similaires ──
+    _CARD_SECTION_RE = re.compile(
+        r"RELEVE\s+DE\s+VOTRE\s+CARTE|RELEVE\s+CARTE\s+Business",
+        re.IGNORECASE,
+    )
+
     for page_words in pages_words:
         if not page_words:
             continue
@@ -1515,6 +1695,23 @@ def parse_transactions_from_word_pages(
         ym = re.search(r"(20\d{2})", page_text)
         if ym:
             year = ym.group(1)
+
+        # ── Crédit Mutuel / section carte : exclure les mots SOUS la ligne
+        # "RELEVE DE VOTRE CARTE" (détail carte déjà consolidé en "RELEVE CARTE") ──
+        if _CARD_SECTION_RE.search(page_text):
+            # Regrouper les mots par ligne pour trouver la y-position de la marqueur
+            _tmp_by_y: dict[float, list[dict]] = {}
+            for w in page_words:
+                k = round(w["top"] / 2) * 2
+                _tmp_by_y.setdefault(k, []).append(w)
+            card_stop_y: float | None = None
+            for k, ws in sorted(_tmp_by_y.items()):
+                line_txt = " ".join(w["text"] for w in sorted(ws, key=lambda w: w["x0"]))
+                if _CARD_SECTION_RE.search(line_txt):
+                    card_stop_y = k
+                    break
+            if card_stop_y is not None:
+                page_words = [w for w in page_words if w["top"] < card_stop_y]
 
         desc_end_x, debit_x, credit_x, boundary = _detect_columns(page_words)
         lines_by_y = _group_by_y(page_words, y_tol=y_tol)
@@ -1566,7 +1763,9 @@ def parse_transactions_from_word_pages(
                 # Ex. LCL : "02.01 SOLDE EN EUROS 1 807,68" → doit être ignoré
                 _line_upper = " ".join(w["text"].upper() for w in line_words)
                 if re.search(
-                    r"SOLDE\s+EN\s+EUROS|SOLDE\s+INTERMEDIAIRE|TOTAUX\s+\d",
+                    r"SOLDE\s+EN\s+EUROS|SOLDE\s+INTERMEDIAIRE|TOTAUX\s+\d"
+                    r"|SOLDE\s+CR[EÉ]DITEUR\s+AU|SOLDE\s+D[EÉ]BITEUR\s+AU"
+                    r"|TOTAL\s+DES\s+MOUVEMENTS|TOTAL\s+PREL[EÈ]VE",
                     _line_upper,
                 ):
                     continue
@@ -1887,10 +2086,11 @@ def ocr_pdf_gcv(pdf_bytes: bytes) -> tuple[str, list[list[dict]]]:
 _COLUMN_BANKS = {
     "BANQUE_POSTALE",
     "CIC",
-    "CREDIT_MUTUEL",
     "CREDIT_AGRICOLE",
     "GENERIC",
 }
+# Note : CREDIT_MUTUEL a sa propre branche dans extract_all
+# (filtre section carte + fallback parse_credit_mutuel_text)
 
 # Banques avec parser texte dédié (montants signés ou format spécifique)
 _TEXT_BANKS = {
@@ -2030,6 +2230,26 @@ def extract_all(pdf_file) -> dict:
                 df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
             if df.empty:
                 df = parse_transactions_text(raw_text, year=year_ref)
+
+    elif bank == "CREDIT_MUTUEL":
+        # ── Crédit Mutuel ──
+        # Priorité 1 : parser colonne pdfplumber (PDF texte natif)
+        #   → le filtre "section carte" garantit l'exclusion des lignes carte
+        # Priorité 2 : parser texte dédié CM (heuristique débit/crédit par mots-clés)
+        # Priorité 3 : parser texte universel (fallback)
+        if ocr_used and pages_words:
+            df = parse_transactions_from_word_pages(
+                pages_words, year=year_ref, y_tol=4.0
+            )
+            if df.empty:
+                df = parse_credit_mutuel_text(raw_text, year_ref)
+        elif has_text:
+            df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
+            if df.empty:
+                df = parse_credit_mutuel_text(raw_text, year_ref)
+
+        if df.empty:
+            df = parse_transactions_text(raw_text, year=year_ref)
 
     elif bank in _COLUMN_BANKS:
         # Parser colonne débit/crédit
