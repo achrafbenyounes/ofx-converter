@@ -970,14 +970,20 @@ def parse_bnp_paribas_text(text: str, year: str | None = None) -> pd.DataFrame:
         year = ym.group(1) if ym else str(datetime.now().year)
 
     # ── En-têtes de section : avec ou sans espaces (pdfplumber supprime les espaces) ──
+    # CRÉDIT : REMISES D'ESPÈCES · REMISES DE CHÈQUES · REMISES DE CARTES · VIREMENTS REÇUS
     _CREDIT_HDR = re.compile(
         r"^REMISES?\s*D.?\s*ESPECES?$|^REMISES?\s*D.?\s*ESPECES?\s+|"
         r"^REMISESDESPECES|^REMISESDECARTES|^REMISESDE\s*CARTES?|"
-        r"^REMISES?\s*DE\s*CARTES?$|^VIREMENTSRECUS?$|^VIREMENTS?\s*RE[CÇ]US?$",
+        r"^REMISES?\s*DE\s*CARTES?$|^VIREMENTSRECUS?$|^VIREMENTS?\s*RE[CÇ]US?$|"
+        # FIX: REMISES DE CHÈQUES (compact pdfplumber ou avec espaces)
+        r"^REMISESDECHEQUES$|^REMISES?\s*DE\s*CH[EÈ]QUES?$",
         re.IGNORECASE,
     )
+    # DÉBIT : PAIEMENTS PAR CARTES · CHÈQUES ÉMIS · VIREMENTS ÉMIS · PRÉLÈVEMENTS · AUTRES OPÉRATIONS DÉBIT
     _DEBIT_HDR = re.compile(
         r"^PAIEMENTSPARCARTES?|^PAIEMENTS?\s*PAR\s*CARTES?|"
+        # FIX: CHÈQUES ÉMIS (compact pdfplumber ou avec espaces)
+        r"^CHEQUESEMIS$|^CH[EÈ]QUES?\s*[EÉ]MIS$|"
         r"^VIREMENTSEMIS$|^VIREMENTS?\s*[EÉ]MIS$|"
         r"^PRELEVEMENTS?[,\s]|^PR[EÉ]L[EÈ]VEMENTS?[,\s]|"
         r"^AUTRESOPERATIONSDEBIT|^AUTRES\s*OP[EÉ]RATIONS?\s*DEBIT",
@@ -989,15 +995,22 @@ def parse_bnp_paribas_text(text: str, year: str | None = None) -> pd.DataFrame:
         r"(^Sous[\s\-]?total|^SOUSTOTAL"
         r"|^DATE\s*COMPTABLE|^NATUREDESOPERATIONS|^DATEDE$|^DEBIT$|^CREDIT$"
         r"|^RELEVE|^RELEVEDEVOTRECOMPTE"
+        # Entêtes compte SAS SHR
         r"|^SAS\s*SHR$|^SOCIETE\s*EN\s*COURS|^ARGENTEUIL|^RIB\s*:"
+        # Entêtes génériques titulaire (SARL, EURL, SASU…) et agences BNP
+        r"|^SARL\b|^EURL\b|^SASU\b"
         r"|^IBAN\s*:\s*FR|^BIC\s*:\s*BNP"
         r"|^PERIODE\s*DU|^Raison\s*sociale"
         r"|^BNP\s*PARIBAS\s*SA|^P\.\s*\d+/\d+|^\d{9,}\s*$"
-        r"|^SORPSITSPREPFC|^600720"
+        r"|^SORPSITSPREPFC|^600720|^503504"
         r"|^Votre\s*charg|^www\.|^3478\s*\("
         r"|^ituation\s*[Pp]ro|^-\s*CARTE\s*N|^CARTEN°"
         r"|TOTALDESO|TOTALDESOP|SOLDE\s*CREDITEUR|Soldecréditeur"
-        r"|Rappel\s*:\s*votre)",
+        r"|Rappel\s*:\s*votre"
+        # Pieds de page BNP pdfplumber compactés
+        r"|^BNPPARIBAS|BNPPARIBASSAau|servicegratuit"
+        r"|^APPLICATIONANTIGASPI$|^NOTPROVIDED$"
+        r")",
         re.IGNORECASE,
     )
 
