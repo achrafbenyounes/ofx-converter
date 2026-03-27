@@ -257,6 +257,8 @@ _OPENING_PATTERNS = [
 ]
 
 _CLOSING_PATTERNS = [
+    # ── Crédit Agricole : "Nouveau solde créditeur au 31.01.2026 2 568,15" ──
+    r"[Nn]ouveau\s+solde\s+cr[ée]diteur\s+au\s+[\d\.\/\-]+\s*" + _AMT,
     # ── BNP Paribas : "Solde créditeur au 31.12.2025 + 496,17" ──
     r"[Ss]olde\s+cr[ée]diteur\s+au\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,
     # ── BNP pdfplumber (pas d'espaces) : "Soldecréditeurau31.12.2025 496,17" ──
@@ -961,7 +963,7 @@ def parse_bnp_paribas_text(text: str, year: str | None = None) -> pd.DataFrame:
       (date comptable, libellé, date valeur, montant en FR : virgule décimale)
 
     Le montant est TOUJOURS le dernier token de la ligne de date,
-    au format français : \d{1,3}(?:\s\d{3})*,\d{2}  (max 3 chiffres par groupe).
+    au format français : \\d{1,3}(?:\\s\\d{3})*,\\d{2}  (max 3 chiffres par groupe).
     """
     if year is None:
         ym = re.search(r"(20\d{2})", text)
@@ -1114,6 +1116,276 @@ def parse_bnp_paribas_text(text: str, year: str | None = None) -> pd.DataFrame:
 
 
 
+# =========================================================
+# PARSER TEXTE CRÉDIT AGRICOLE (Brie Picardie & variantes)
+# =========================================================
+
+def parse_credit_agricole_text(text: str, year: str | None = None) -> pd.DataFrame:
+    """
+    Parser texte dédié Crédit Agricole (Brie Picardie et variantes régionales).
+
+    Structure du relevé CA pdfplumber :
+      DD.MM  DD.MM  [Type]  Description...  montant  [¨]
+
+    Deux colonnes séparées Débit / Crédit (sans signe sur les montants).
+    Dates : DD.MM seulement → année déduite depuis "Date d'arrêté : JJ Mois AAAA".
+
+    Détermination débit/crédit par type d'opération :
+    ┌────────────────────────────────────────────┬─────────┐
+    │ Remise Carte …                             │ crédit  │
+    │ Rem Chq …                                  │ crédit  │
+    │ Virement [société entrante]                │ crédit  │
+    │   (Uber, Edenred, Swile crédit, Up Coop…)  │         │
+    ├────────────────────────────────────────────┼─────────┤
+    │ Com Carte …  (commission TPE)              │ débit   │
+    │ Prlv …       (prélèvement SEPA)            │ débit   │
+    │ Carte X[0-9]{4} … (paiement CB magasin)    │ débit   │
+    │ Virement Vir Inst vers … (sortant)         │ débit   │
+    │ Virement Web service des impot…            │ débit   │
+    │ Cotis …      (cotisation compte)           │ débit   │
+    └────────────────────────────────────────────┴─────────┘
+
+    Validation : Total des opérations DD DD (débit total, crédit total) en bas de relevé.
+    """
+
+    # ── 1. Année de référence ──
+    if year is None:
+        # "Date d'arrêté : 31 Janvier 2026"
+        ym = re.search(
+            r"d['']arr[êe]t[ée]\s*:\s*\d{1,2}\s+\w+\s+(\d{4})",
+            text, re.IGNORECASE,
+        )
+        if ym:
+            year = ym.group(1)
+        else:
+            ym2 = re.search(r"(20\d{2})", text)
+            year = ym2.group(1) if ym2 else str(datetime.now().year)
+
+    # ── 2. Tronquer avant totaux finaux ──
+    for stop in [
+        r"Total\s+des\s+op[ée]rations",
+        r"Nouveau\s+solde\s+cr[ée]diteur",
+        r"Nouveau\s+solde\s+d[ée]biteur",
+    ]:
+        sm = re.search(stop, text, re.IGNORECASE)
+        if sm:
+            text = text[: sm.start()]
+            break
+
+    # ── 3. Lignes à ignorer ──
+    _SKIP = re.compile(
+        r"RELEVE\s+DE\s+COMPTES?"
+        r"|Date\s+d['']arr[êe]"
+        r"|CREDIT\s+AGRICOLE"
+        r"|BRIE\s+PICARDIE"
+        r"|Votre\s+agence"
+        r"|Votre\s+conseiller"
+        r"|Vos\s+contacts"
+        r"|Page\s+\d+\s*/\s*\d+"
+        r"|SYNTHESE"
+        r"|Compte\s+Courant\s+n[°o]"
+        r"|IBAN\s*:"
+        r"|BIC\s*:"
+        r"|Date\s+op[eé]"
+        r"|Lib[eé]ll[eé]\s+des\s+op[eé]rations"
+        r"|Ancien\s+solde\s+cr[ée]diteur"
+        r"|Ancien\s+solde\s+d[ée]biteur"
+        r"|Les\s+sommes\s+figurant"
+        r"|Garantie\s+des\s+D[eé]p"
+        r"|500\s+Rue\s+Saint"
+        r"|RCS\s+AMIENS"
+        r"|Tél\s*:"
+        r"|Fax\s*:"
+        r"|SOS\s+(?:Cartes|Chèques|Virements)"
+        r"|L'agence\s+en\s+ligne"
+        r"|Num[eé]ros\s+d'urgence"
+        r"|Internet\s*:"
+        r"|www\."
+        r"|^S\.?[Aa]\.?[Ss]\."
+        r"|Rue\s+[A-Z]"
+        r"|COMPIEGNE|AMIENS|CEDEX"
+        r"|^\d{9,}\s*$"
+        r"|Appel\s+non\s+surtax",
+        re.IGNORECASE,
+    )
+
+    # ── 4. Mots-clés CRÉDIT (argent entrant) ──
+    _CREDIT_RE = re.compile(
+        # Remise TPE (encaissement carte bancaire client)
+        r"^Remise\s+Carte\b"
+        # Remise chèque
+        r"|^Rem(?:ise)?\s+Chq\b"
+        # Virements entrants connus : Uber Eats, Swile, Edenred, Up Coop, Quatra remboursement
+        r"|^Virement\s+(?:Stichting|Edenred|Up\s+Coop|Quatra)\b",
+        re.IGNORECASE,
+    )
+
+    # ── 5. Mots-clés DÉBIT (argent sortant) ──
+    _DEBIT_RE = re.compile(
+        # Commission bancaire sur remise carte
+        r"^Com\s+Carte\b"
+        # Prélèvement SEPA (assurances, loyers, abonnements…)
+        r"|^Prlv\b"
+        # Paiement carte de débit en magasin  (Carte X7740 …)
+        r"|^Carte\s+X\d{4}\b"
+        # Virement instantané sortant (toujours "Vir Inst vers [bénéficiaire]")
+        r"|^Virement\s+Vir\s+Inst\s+vers\b"
+        # Paiement impôts / services web fiscaux
+        r"|^Virement\s+Web\s+service\s+des\s+impot"
+        # Virement web vers un fournisseur quelconque (paiement sortant via e-banking)
+        # Les virements Web entrants sont capturés plus haut (Stichting, Edenred…)
+        r"|^Virement\s+Web\b"
+        # Cotisation tenue de compte
+        r"|^Cotis\b",
+        re.IGNORECASE,
+    )
+
+    # ── 6. Regex début de ligne transaction CA ──
+    # Format : DD.MM suivi d'un second DD.MM (date valeur), puis description
+    _TX_START = re.compile(r"^(\d{2}\.\d{2})\s+\d{2}\.\d{2}\s+(.*)")
+
+    # ── Montant CA en fin de bloc (avant checkbox ¨ optionnel) ──
+    # RÈGLE CRITIQUE : lookbehind (?<![\d/.]) pour ne jamais capturer un sous-groupe
+    # de chiffres faisant partie d'une date (DD/MM) ou d'un numéro de référence.
+    #   Exemples corrects   : "1 000,00"  "370,30"  "61,97"  "0,54"
+    #   Exemples à ÉVITER   :
+    #     "02/01 236,33"  → "01 236,33" est ambigu → on exclut via (?<![\d/.])
+    #                        car `01` est précédé par `/`  → lookbehind ÉCHOUE ✓
+    #                        mais `236,33` précédé par ` ` → lookbehind RÉUSSIT ✓
+    #     "5326895 370,30" → `895 370,30` précédé par `6` (digit) → ÉCHOUE ✓
+    #                        `370,30` précédé par ` `            → RÉUSSIT ✓
+    #     "1-30634 705,00" → `705,00` précédé par ` `            → RÉUSSIT ✓
+    # Deux branches (même lookbehind commun) :
+    #   • \d{1,3}(?:[\s\xa0]\d{3})+,\d{2}  → milliers : "1 000,00", "13 714,49"
+    #   • \d{1,3},\d{2}                     → simple    : "61,97", "0,54", "370,30"
+    _AMT_PATTERN = (
+        r"(?<![\d/\.])(\d{1,3}(?:[\s\xa0]\d{3})+,\d{2}"  # milliers : 1 000,00
+        r"|\d{1,3},\d{2})"                                 # simple   : 61,97
+    )
+    _AMT_END = re.compile(_AMT_PATTERN + r"\s*[¨□]*\s*$")
+    _AMT_ANY = re.compile(_AMT_PATTERN)          # pour fallback (findall)
+
+    # ── 7. Parsing ──
+    lines = [ln.strip() for ln in text.replace("\r\n", "\n").split("\n") if ln.strip()]
+    transactions: list[dict] = []
+    block: list[str] = []
+    block_date: str | None = None
+
+    def _determine_sign_ca(desc: str) -> int:
+        """Retourne +1 (crédit) ou -1 (débit)."""
+        d = desc.strip()
+        if _CREDIT_RE.match(d):
+            return 1
+        if _DEBIT_RE.match(d):
+            return -1
+
+        # ── Heuristiques supplémentaires sur le texte complet du bloc ──
+        # Remise Carte (variantes de casse/formatage pdfplumber)
+        if re.search(r"\bRemise\s+Carte\b", d, re.IGNORECASE):
+            return 1
+        if re.search(r"\bRem\s+Chq\b", d, re.IGNORECASE):
+            return 1
+
+        # Virement sortant instant (vers tiers nommé)
+        if re.search(r"\bVir\s+Inst\s+vers\b", d, re.IGNORECASE):
+            return -1
+        # Service des impôts
+        if re.search(r"\bservice\s+des\s+impot\b", d, re.IGNORECASE):
+            return -1
+
+        # Swile : peut apparaître en CRÉDIT (virement entrant Swile Transfer)
+        # ou en DÉBIT (prélèvement Swile). La présence de "Prlv" en début suffit
+        # (capturé par _DEBIT_RE). Ici on gère le cas "Virement Swile" → crédit.
+        if re.search(r"\bVirement\s+Swile\b", d, re.IGNORECASE):
+            return 1
+
+        # Virements entrants connus (Uber Eats, Edenred, Up Coop, VSCT…)
+        if re.search(
+            r"\b(Stichting|Custodian|Uber|Edenred|Up\s+Coop|Quatra|VSCT)\b",
+            d, re.IGNORECASE,
+        ):
+            return 1
+
+        # Tout autre Virement sans indicateur = débit (conservateur)
+        # Rationale : les virements entrants connus sont listés ci-dessus ;
+        # un virement non reconnu est plus probablement un paiement sortant.
+        if re.match(r"^Virement\b", d, re.IGNORECASE):
+            return -1
+
+        # Prlv / Com / Cotis / Carte X → débit
+        if re.search(r"^(?:Prlv|Com\s+Carte|Cotis|Carte\s+X\d{4})\b", d, re.IGNORECASE):
+            return -1
+
+        # Défaut conservateur : débit
+        return -1
+
+    def _process_ca_block(blines: list[str], bdate: str) -> dict | None:
+        full = " ".join(blines).strip()
+        # Supprimer le checkbox ¨ en fin
+        full_clean = re.sub(r"\s*[¨□]\s*$", "", full).rstrip()
+
+        # Extraire le montant : chercher en fin du bloc nettoyé
+        m_amt = _AMT_END.search(full_clean + " ")  # espace pour $
+        if m_amt:
+            amount = clean_amount(m_amt.group(1))
+        else:
+            # Fallback : dernier token numérique valide du bloc
+            tokens = _AMT_ANY.findall(full_clean)
+            if not tokens:
+                return None
+            amount = clean_amount(tokens[-1])
+
+        if amount is None or amount == 0:
+            return None
+
+        # Description = supprimer les deux dates initiales
+        desc = re.sub(r"^\d{2}\.\d{2}\s+\d{2}\.\d{2}\s*", "", full_clean)
+        # Supprimer le montant final (même pattern deux branches)
+        desc = re.sub(
+            r"\s*(?:\d{1,2}(?:[\s\xa0]\d{3})+,\d{2}|\d{1,3},\d{2})\s*[¨□]*\s*$",
+            "", desc,
+        )
+        desc = desc.replace("¨", "").replace("□", "").strip()
+        desc = re.sub(r"\s{2,}", " ", desc)[:120]
+
+        sign = _determine_sign_ca(desc)
+        montant = sign * abs(amount)
+
+        # Date → DD/MM/YYYY
+        date_str = f"{bdate[:2]}/{bdate[3:]}/{year}"
+        return {"date": date_str, "libelle": desc, "montant": round(montant, 2)}
+
+    for line in lines:
+        if not line or _SKIP.search(line):
+            continue
+
+        m_tx = _TX_START.match(line)
+        if m_tx:
+            # Flush bloc précédent
+            if block and block_date:
+                tx = _process_ca_block(block, block_date)
+                if tx:
+                    transactions.append(tx)
+            block_date = m_tx.group(1)   # DD.MM
+            block = [line]
+        elif block_date:
+            # Ligne de continuation (description multi-lignes)
+            block.append(line)
+
+    # Flush du dernier bloc
+    if block and block_date:
+        tx = _process_ca_block(block, block_date)
+        if tx:
+            transactions.append(tx)
+
+    if not transactions:
+        return pd.DataFrame(columns=["date", "libelle", "montant"])
+
+    df = pd.DataFrame(transactions)
+    df["montant"] = df["montant"].round(2)
+    return df
+
+
 def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFrame:
     """
     Parser texte dédié Société Générale — relevé professionnel CTC INDEXE TAUX BASE SG.
@@ -1226,7 +1498,7 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
         Cherche le montant dans le bloc :
           1. Dernière ligne autonome (_AMT_LINE)
           2. Montant en fin de la première ligne (_AMT_INLINE) — transactions simples
-          3. Tout dernier token numérique \d+,\d{2} dans le bloc
+          3. Tout dernier token numérique \\d+,\\d{2} dans le bloc
         """
         # 1. Ligne autonome (chercher en remontant depuis la fin)
         for ln in reversed(blines):
@@ -1632,6 +1904,9 @@ def _extract_amount_from_zone(
     """
     Extrait un montant de la zone [col_start, col_end].
     Gère montants fractionnés La Banque Postale : "1" + "702,68" → 1702.68
+    Gère montants multiples de 1000 : "5" + "000,00" → 5000.00
+      → BUG FIX : clean_amount("000,00") retourne None (valeur=0), ce qui empêchait
+        la reconstruction "X * 1000 + 0" pour des montants comme 5 000,00 €, 10 000,00 €…
     """
     zone = sorted(
         [w for w in line_words if col_start - 5 <= w["x0"] <= col_end + 5],
@@ -1641,6 +1916,20 @@ def _extract_amount_from_zone(
         if is_amount_word(w["text"]):
             base = clean_amount(w["text"])
             if base is None:
+                # clean_amount retourne None quand la valeur vaut exactement 0
+                # (ex : "000,00", "0,00"). On vérifie s'il s'agit d'un fragment
+                # "N 000,00" représentant un multiple de 1 000 (5 000 €, 10 000 €…).
+                if i > 0 and is_leading_digit(zone[i - 1]["text"]):
+                    try:
+                        raw = re.sub(r"[^\d,.]", "", w["text"]).replace(",", ".")
+                        base_val = float(raw) if raw else None
+                        if base_val is not None:
+                            prefix = int(zone[i - 1]["text"])
+                            result = round(prefix * 1000 + base_val, 2)
+                            if result > 0:
+                                return result
+                    except Exception:
+                        pass
                 continue
             if i > 0 and is_leading_digit(zone[i - 1]["text"]):
                 prefix = int(zone[i - 1]["text"])
@@ -2086,11 +2375,12 @@ def ocr_pdf_gcv(pdf_bytes: bytes) -> tuple[str, list[list[dict]]]:
 _COLUMN_BANKS = {
     "BANQUE_POSTALE",
     "CIC",
-    "CREDIT_AGRICOLE",
     "GENERIC",
 }
 # Note : CREDIT_MUTUEL a sa propre branche dans extract_all
 # (filtre section carte + fallback parse_credit_mutuel_text)
+# Note : CREDIT_AGRICOLE a sa propre branche dans extract_all
+# (parse_credit_agricole_text en priorité, parser colonne en fallback)
 
 # Banques avec parser texte dédié (montants signés ou format spécifique)
 _TEXT_BANKS = {
@@ -2230,6 +2520,28 @@ def extract_all(pdf_file) -> dict:
                 df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
             if df.empty:
                 df = parse_transactions_text(raw_text, year=year_ref)
+
+    elif bank == "CREDIT_AGRICOLE":
+        # ── Crédit Agricole (Brie Picardie & variantes régionales) ──
+        # Priorité 1 : parser colonne pdfplumber (PDF texte natif)
+        #   → utilise les positions x des mots pour distinguer colonne Débit / Crédit
+        #   → le plus fiable car indépendant du contenu textuel des libellés
+        # Priorité 2 : parser texte dédié CA
+        #   → dates DD.MM, détection débit/crédit par mots-clés d'opération
+        #   → utilisé pour les PDF OCR ou si le parser colonne échoue
+        # Priorité 3 : parser texte universel (fallback ultime)
+        if has_text:
+            df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
+            if df.empty:
+                df = parse_credit_agricole_text(raw_text, year_ref)
+        elif ocr_used and pages_words:
+            df = parse_transactions_from_word_pages(
+                pages_words, year=year_ref, y_tol=4.0
+            )
+            if df.empty:
+                df = parse_credit_agricole_text(raw_text, year_ref)
+        if df.empty:
+            df = parse_transactions_text(raw_text, year=year_ref)
 
     elif bank == "CREDIT_MUTUEL":
         # ── Crédit Mutuel ──
