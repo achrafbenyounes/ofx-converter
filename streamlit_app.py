@@ -1465,22 +1465,38 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
         ym = re.search(r"(20\d{2})", text)
         year = ym.group(1) if ym else str(datetime.now().year)
 
-    # Tronquer avant les lignes de totaux finaux
-    for stop in [r"TOTAUX\s+DES\s+MOUVEMENTS", r"NOUVEAU\s+SOLDE\s+AU"]:
+    # Tronquer avant les lignes de totaux finaux.
+    # IMPORTANT : pdfplumber fusionne les mots → "TOTAUX DES MOUVEMENTS" devient
+    # "TOTAUXDESMOUVEMENTS" ; utiliser \s* (zéro ou plus d'espaces) pour les deux formes.
+    for stop in [r"TOTAUX\s*DES\s*MOUVEMENTS", r"NOUVEAU\s*SOLDE\s*AU"]:
         sm = re.search(stop, text, re.IGNORECASE)
         if sm:
             text = text[: sm.start()]
             break
 
     # Lignes à ignorer (en-têtes, pieds de page, métadonnées SG)
+    # NOTE : pdfplumber fusionne parfois les mots (espaces supprimés) → \s* dans les patterns.
+    # Le timbre ADEME en marge droite produit des lignes parasites : BGSY10_…, ":", "EMEDA", "°N".
     _SKIP = re.compile(
-        r"^(Date\s+Valeur|Nature\s+de\s+l|RELEVÉ\s+DES|suite\s*>>>|Page\s+\d"
-        r"|N°\s*ADEME|Société\s+Générale|S\.A\.\s+au\s+capital|Siège\s+Social"
-        r"|29[,\s]+bd\s+Haussmann|RA\d{4,}|SOLDE\s+PR[EÉ]C[EÉ]DENT"
-        r"|RELEVÉ\s+DE\s+COMPTE|CTC\s+INDEXE|VOS\s+CONTACTS|Pour\s+toute"
+        r"^(Date\s+Valeur|Nature\s+de\s+l|RELEVÉ\s*DES|suite\s*>>>|Page\s+\d"
+        r"|N°\s*ADEME|Société\s*Générale|SociétéGénérale"
+        r"|S\.A\.\s*au\s*capital|SiègeSocial|Siège\s+Social"
+        r"|29[,\s]+bd\s+Haussmann|RA\d{4,}|SOLDE\s*PR[EÉ]C[EÉ]DENT"
+        r"|RELEVÉ\s*DE\s*COMPTE|CTC\s*INDEXE|VOS\s*CONTACTS|Pour\s+toute"
         r"|Votre\s+[Bb]anque|Votre\s+agence|Votre\s+conseiller"
-        r"|\*\s*Op[eé]ration\s+exon|552\s+120\s+222|RCS\s+Paris"
-        r"|1\s+Depuis\s+l'[eé]tranger|Depuis\s+l'[eé]tranger)",
+        r"|\*\s*Op[eé]ration\s+exon|552\s*120\s*222|RCS\s+Paris"
+        r"|1\s*Depuis\s*l..[eé]tranger|Depuis\s*l..[eé]tranger"
+        r"|BGSY\d"                             # timbre ADEME (ex: BGSY10_527132RF)
+        r"|^:\s*$"                             # ligne avec seulement ":"
+        r"|^°N\s*$"                            # fragment "°N" du timbre N° ADEME
+        r"|^EMEDA\s*$"                         # fragment "EMEDA" du timbre ADEME
+        r"|PROGRAMME\s*DE\s*FID[EÉ]LIT[EÉ]"  # pied de page fidélité
+        r"|Montant\s*cumul[eé]\s*des\s*d[eé]penses"
+        r"|Rappel\s*des\s*seuils\s*de\s*d[eé]clenchement"
+        r"|euros\s+d[eé]pens[eé]s\s+sur\s+une\s+p[eé]riode"
+        r"|pour\s+une\s+r[eé]duction\s+de\s+\d+%"
+        r"|INFO\s*CHEQUIER"                    # notice chéquier
+        r"|dans\s+votre\s+agence\s+\w)",
         re.IGNORECASE,
     )
 
@@ -1542,7 +1558,21 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
     block_date: str | None = None
 
     def _determine_sign(full_text: str) -> int:
-        """Retourne +1 (crédit) ou -1 (débit) selon les mots-clés du bloc."""
+        """Retourne +1 (crédit) ou -1 (débit) selon les mots-clés du bloc.
+
+        Cas spécial INT DEBITEURS ET CION DECOUVERT :
+          Ce libellé peut être un DÉBIT (frais d'intérêts sur découvert) ou un CRÉDIT
+          (remboursement d'intérêts, ex. : solde positif toute l'année).
+          Heuristique : si les lignes de détail contiennent des montants négatifs
+          ("-0,44", "-0,42" …), c'est un avoir → CRÉDIT.
+          Sinon (montants positifs, ex. "0,27") → DÉBIT réel.
+        """
+        # ── Cas INT DEBITEURS : détecter crédit vs débit via les détails ──
+        if re.search(r"INT\s*D[EÉ]BITEURS", full_text, re.IGNORECASE):
+            if re.search(r"-\s*\d+[,\.]\d{2}", full_text):
+                return 1   # montants négatifs dans les détails → remboursement → crédit
+            return -1      # montants positifs → frais réels → débit
+
         is_credit = bool(_CREDIT_RE.search(full_text))
         is_debit  = bool(_DEBIT_RE.search(full_text))
         if is_credit and not is_debit:
