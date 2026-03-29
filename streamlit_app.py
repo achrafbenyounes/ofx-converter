@@ -217,6 +217,11 @@ def extract_iban_bic(text: str) -> tuple[str | None, str | None]:
 _AMT = r"([\+\-]?\s*€?\s*\d[\d\s\xa0]*(?:\.\d{3})*[,\.]\d{2})"
 
 _OPENING_PATTERNS = [
+    # ── Banque Populaire Occitane : "SOLDE CREDITEURAU05/02/2026 59 240,29 €"
+    #    pdfplumber colle CREDITEURAU sans espace — forme UNIQUE à BP Occitane.
+    #    Doit être en PREMIER : la forme avec espaces matcherait sinon
+    #    l'intermédiaire de fin de mois et non l'ouverture.
+    r"SOLDE\s*CREDITEUR(?:AU|\s+AU)\s*\d{2}/\d{2}/\d{4}\s*" + _AMT,
     # ── BNP Paribas : ligne "+ 3 351,28  Débit : 20 118,38  + 496,17"
     #    Le solde d'ouverture précède "Débit :" sur cette ligne ──
     r"([\+\-]?\s*\d[\d\s\xa0]*[,\.]\d{2})\s+D[ée]bit\s*:",
@@ -253,7 +258,7 @@ _OPENING_PATTERNS = [
     r"[Ss]olde\s+[àa]\s+la\s+date\s+du\s+\d{2}/\d{2}/\d{4}\s*:?\s*" + _AMT,
     r"SOLDE\s+EN\s+DEBUT\s+DE\s+PERIODE\s*:?\s*" + _AMT,
     # ── Caisse d'Épargne : "SOLDE CREDITEUR AU 31/10/2025 + 5 967,83" ──
-    r"SOLDE\s+CREDITEUR\s+AU\s+\d{2}/\d{2}/\d{4}\s*" + _AMT,
+    r"SOLDE\s*CREDITEUR\s*AU\s*\d{2}/\d{2}/\d{4}\s*" + _AMT,
     # ── Revolut Business (anglais) ──
     r"[Oo]pening\s+[Bb]alance\s*:?\s*€?\s*" + _AMT,
 ]
@@ -265,6 +270,9 @@ _CLOSING_PATTERNS = [
     r"[Ss]olde\s+cr[ée]diteur\s+au\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,
     # ── BNP pdfplumber (pas d'espaces) : "Soldecréditeurau31.12.2025 496,17" ──
     r"Soldecr[ée]diteurau\d{2}\.\d{2}\.\d{4}\s*" + _AMT,
+    # ── Banque Populaire Occitane : "SOLDE CREDITEUR AU 05/03/2026* 67 491,10 €"
+    #    pdfplumber conserve l'astérisque réglementaire après la date ──
+    r"SOLDE\s*CREDITEUR(?:AU|\s*AU)\s*\d{2}/\d{2}/\d{4}\*?\s*" + _AMT,
     # ── Société Générale : "NOUVEAU SOLDE AU 31/10/2025 + 3.014,95" (normal) ──
     r"NOUVEAU\s+SOLDE\s+AU\s+\d{2}/\d{2}/\d{4}\s*" + _AMT,
     # ── SG compact (pdfplumber) : "NOUVEAUSOLDEAU31/10/2025 +3.014,95" ──
@@ -314,6 +322,13 @@ def extract_closing_balance(text: str) -> float | None:
         r"[Ss]olde\s+cr[ée]diteur\s+au\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,
         # BNP pdfplumber (pas d'espaces) : "Soldecréditeurau31.12.2025 496,17"
         r"Soldecr[ée]diteurau\d{2}\.\d{2}\.\d{4}\s*" + _AMT,
+        # ── Banque Populaire Occitane : toutes occurrences (joined + spaced + astérisque)
+        #    "SOLDE CREDITEURAU05/02/2026 59 240,29 €"  (ouverture)
+        #    "SOLDE CREDITEUR AU 28/02/2026 74 477,85 €" (intermédiaire)
+        #    "SOLDE CREDITEUR AU 05/03/2026* 67 491,10 €" (clôture)
+        #    → findall prend le DERNIER = solde de clôture
+        #    ⚠ `\s*` après AU (pas \s+) car pdfplumber colle "AU" et la date dans la 1ère occurrence ──
+        r"SOLDE\s*CREDITEUR(?:AU|\s*AU)\s*\d{2}/\d{2}/\d{4}\*?\s*" + _AMT,
     ]
     for pat in multi_patterns:
         matches = re.findall(pat, text, re.IGNORECASE | re.MULTILINE)
@@ -610,79 +625,172 @@ def parse_shine_text(text: str) -> pd.DataFrame:
 
 def parse_banque_populaire_text(text: str) -> pd.DataFrame:
     """
-    Banque Populaire — colonne MONTANT unique avec signe et suffixe €.
-    Ex : "42,55 €" (crédit)  |  "- 178,46 €" (débit)
-    Dates : DD/MM (sans année dans les lignes de transactions).
+    Banque Populaire Occitane — Parser natif pdfplumber (relevé mensuel PDF texte).
+
+    Structure pdfplumber constatée :
+    ─────────────────────────────────────────────────────────────────────────
+    Ligne 1 : DD/MM  LIBELLE REFERENCE  DD/MM  DD/MM  [-]MONTANT€
+    Lignes + : continuation — référence interne, bénéficiaire, marchand, etc.
+    ─────────────────────────────────────────────────────────────────────────
+
+    Corrections v2 (Banque Populaire Occitane réel) :
+      1. Le MONTANT est TOUJOURS en fin de la 1ère ligne du bloc : "[-]X XXX,XX €"
+         → Extraction uniquement sur line[0], pas du bloc entier.
+         → L'ancien code concaténait toutes les lignes → échec sur les blocs
+           contenant "178,46EUR 1 EURO = 1,000000" (taux change CB) en fin.
+      2. Lignes "XXX,XXEUR 1 EURO = 1,000000" (taux de change carte) ignorées.
+      3. Lignes "- NB0079/108105" (références internes banque) ignorées.
+      4. pdfplumber peut coller des mots : "CREDITEURAU" → patterns solde adaptés
+         (voir _OPENING_PATTERNS / _CLOSING_PATTERNS).
+      5. Signe "-" peut être collé au chiffre ("-5,87 €") ou séparé ("- 178,46 €").
+      6. Milliers séparés par espace : "1 269,59 €", "-1 269,59 €".
+      7. Solde clôture avec astérisque : "AU 05/03/2026* 67 491,10 €" → géré.
     """
+    # ── 1. Extraire l'année de référence ─────────────────────────────────────
     year = str(datetime.now().year)
-    m = re.search(r"SOLDE CREDITEUR AU \d{2}/\d{2}/(\d{4})", text, re.IGNORECASE)
-    if m:
-        year = m.group(1)
-    else:
-        m = re.search(r"\b(20\d{2})\b", text)
+    for pat in [
+        r"RELEVE\s+N[°o]?\s*\d+\s+AU\s+\d{2}/\d{2}/(\d{4})",
+        r"relev[ée]\s+de\s+compte\s+n[°o]?\d+\s+au\s+\d{2}/\d{2}/(\d{4})",
+        r"SOLDE\s+CREDITEUR(?:AU|\s+AU)\s+\d{2}/\d{2}/(\d{4})",
+        r"\b(20\d{2})\b",
+    ]:
+        m = re.search(pat, text, re.IGNORECASE)
         if m:
             year = m.group(1)
+            break
 
-    transactions: list[dict] = []
-    block: list[str] = []
+    # ── 2. Délimiter la zone utile ───────────────────────────────────────────
+    detail_m = re.search(r"DETAIL\s+DES\s+OPERATIONS", text, re.IGNORECASE)
+    if detail_m:
+        text = text[detail_m.start():]
 
-    # Lignes à ignorer
+    for stop_pat in [
+        r"TOTAL\s+DES\s+MOUVEMENTS\s+DEBITEURS",
+        r"DETAIL\s+DE\s+VOS\s+(?:PRELEVEMENTS|VIREMENTS|MOUVEMENTS)\s+SEPA",
+    ]:
+        sm = re.search(stop_pat, text, re.IGNORECASE)
+        if sm:
+            text = text[:sm.start()]
+            break
+
+    # ── 3. Regex : montant signé en fin de première ligne ────────────────────
+    # Structure ligne 1 : "DD/MM LIBELLE REF DATEOP DATEVAL MONTANT€"
+    # Le montant SUIT toujours les deux dates DD/MM DD/MM.
+    # On intègre ces deux dates dans le regex pour ancrer correctement l'extraction
+    # et éviter que \d{1,3} capture "2" depuis "06/02" suivi de " 101,10 €".
+    # Groupe 1 = signe "-" optionnel, Groupe 2 = valeur numérique (virgule décimale FR)
+    _LINE_AMOUNT = re.compile(
+        r"\d{2}/\d{2}\s+\d{2}/\d{2}\s+(-\s*)?(\d{1,3}(?:[\s\xa0]\d{3})*,\d{2})\s*€\s*$"
+    )
+
+    # ── 4. Lignes à ignorer (en-têtes, pieds de page, soldes) ───────────────
     _SKIP = re.compile(
-        r"DATE\s+COMPTA|LIBELLE|REFERENCE|SOLDE\s+CREDITEUR|PAGE\s+\d|"
-        r"Banque\s+Populaire|DETAIL\s+DES\s+OPERATIONS|BIC\s*:|IBAN\s*:",
+        r"^DATE\s+COMPTA|^LIBELLE\s*/\s*REFERENCE|^DATE\s+OPERATION|^DATE\s+VALEUR"
+        r"|^DATE\s+DATE|^LIBELLE\s*/|^MONTANT$"
+        # Lignes entête de colonnes fusionnées par pdfplumber (ex: "DATE DATE DATE LIBELLE")
+        r"|^(?:DATE\s+){2,}|LIBELLE\s*/\s*REFERENCE"
+        r"|SOLDE\s+CREDITEUR"          # lignes de solde (pas des transactions)
+        r"|TOTAL\s+DES\s+MOUVEMENTS"   # résumé en pied
+        r"|^VOTRE\s*COMPTE\s+COURANT"
+        r"|^RELEVE\s+N[°o]"
+        r"|^Page\s*\d|^page\s*\d|^Page\d"
+        r"|^COMPTA\s+OPERATION|^COMPTA\s*OPER"   # en-tête ligne 2 des colonnes
+        r"|Banque\s+Populaire\s+Occitane"
+        r"|textes\s+relatifs|Pompidou|ORIAS|RCS\s+TOULOUSE"
+        r"|Méd[ié]ateure?|médiation|FNBP"
+        r"|DETAIL\s+DES\s+OPERATIONS"
+        r"|IBAN\s*:|BIC\s*:"
+        r"|SARL\s+PALAIS\s+ROYAL"
+        r"|MESSAGE\s+DE\s+VOTRE\s+BANQUE"
+        r"|Votre\s+Agence|VotreConseill|Votre\s+Conseill"
+        r"|TARIFICATION|RÈGLEMENTATION|MONÉTIQUE|MONETIQUE"
+        r"|www\.banquepopulaire|BANQUEPOPULAIRE",
         re.IGNORECASE,
     )
 
-    def process_bp_block(blines: list[str]) -> dict | None:
-        full = " ".join(blines).strip()
-        if not re.match(r"^\d{2}/\d{2}\b", full):
+    # Lignes de continuité à NE PAS inclure dans la description
+    _NOISE_LINE = re.compile(
+        # Taux de change CB : "178,46EUR 1 EURO = 1,000000"
+        r"^\d[\d\s]*[,\.]\d+EUR\s+1\s+EURO\s*=\s*1[,\.]0+\s*$"
+        # Référence interne banque : "- NB0079/108105"
+        r"|^-\s*NB\d+/\d+$"
+        # En-têtes de colonnes glissés dans la continuité : "DATE DATE DATE" etc.
+        r"|^(?:DATE\s+){2,}DATE?\s*$"
+        r"|^LIBELLE\s*/\s*REFERENCE",
+        re.IGNORECASE,
+    )
+
+    # ── 5. Grouper lignes → blocs, puis parser ───────────────────────────────
+    transactions: list[dict] = []
+    block_lines: list[str] = []
+
+    def flush_block(blines: list[str]) -> dict | None:
+        if not blines:
+            return None
+        first = blines[0]
+
+        # La ligne 1 doit commencer par DD/MM
+        dm = re.match(r"^(\d{2}/\d{2})\b", first)
+        if not dm:
+            return None
+        date_str = f"{dm.group(1)}/{year}"
+
+        # Montant en fin de ligne 1 uniquement
+        m_amt = _LINE_AMOUNT.search(first)
+        if not m_amt:
             return None
 
-        date_m = re.match(r"^(\d{2}/\d{2})", full)
-        date_part = date_m.group(1)
-
-        # Montant final : optionnel signe "-", chiffres, virgule/point, 2 déc., €/EUR
-        m = re.search(
-            r"(-\s*)?(\d[\d\s\xa0]*[,\.]\d{2})\s*(?:€|EUR)\s*$",
-            full,
-            re.IGNORECASE,
-        )
-        if not m:
-            return None
-
-        sign_neg = bool(m.group(1))
-        amount = clean_amount(m.group(2))
+        sign_neg = bool(m_amt.group(1) and m_amt.group(1).strip())
+        amount = clean_amount(m_amt.group(2))
         if amount is None:
             return None
-
         montant = -abs(amount) if sign_neg else abs(amount)
 
-        # Description
-        desc = full[len(date_part):].strip()
-        desc = re.sub(r"(-\s*)?\d[\d\s\xa0]*[,\.]\d{2}\s*(?:€|EUR)\s*$", "", desc, flags=re.IGNORECASE)
-        desc = re.sub(r"\s{2,}", " ", desc).strip()[:120]
+        # ── Construction de la description ──
+        # a) Première ligne : retirer la date initiale + le bloc [DATEOP DATEVAL MONTANT€]
+        desc_first = first[len(dm.group(1)):].strip()
+        # Le regex _LINE_AMOUNT intègre "DD/MM DD/MM MONTANT €" → le sub supprime tout d'un coup
+        desc_first = _LINE_AMOUNT.sub("", desc_first).strip()
 
-        return {"date": f"{date_part}/{year}", "libelle": desc, "montant": round(montant, 2)}
+        # b) Lignes de continuation (max 2), en filtrant le bruit
+        extra_parts: list[str] = []
+        for ln in blines[1:3]:
+            if _NOISE_LINE.match(ln):
+                continue
+            extra_parts.append(ln.strip())
 
-    for line in (ln.strip() for ln in text.split("\n")):
-        if not line or _SKIP.search(line):
+        desc = desc_first
+        if extra_parts:
+            desc = (desc + " " + " ".join(extra_parts)).strip()
+        desc = re.sub(r"\s{2,}", " ", desc)[:120]
+
+        return {"date": date_str, "libelle": desc, "montant": round(montant, 2)}
+
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line:
             continue
-        if re.match(r"^\d{2}/\d{2}\b", line):
-            if block:
-                tx = process_bp_block(block)
-                if tx:
-                    transactions.append(tx)
-            block = [line]
-        elif block:
-            block.append(line)
+        if _SKIP.search(line):
+            continue
 
-    if block:
-        tx = process_bp_block(block)
-        if tx:
-            transactions.append(tx)
+        if re.match(r"^\d{2}/\d{2}\b", line):
+            # Nouvelle transaction → vider le bloc précédent
+            tx = flush_block(block_lines)
+            if tx:
+                transactions.append(tx)
+            block_lines = [line]
+        else:
+            if block_lines:
+                block_lines.append(line)
+
+    # Dernier bloc
+    tx = flush_block(block_lines)
+    if tx:
+        transactions.append(tx)
 
     if not transactions:
         return pd.DataFrame(columns=["date", "libelle", "montant"])
+
     df = pd.DataFrame(transactions)
     df["montant"] = df["montant"].round(2)
     return df
@@ -2791,19 +2899,6 @@ def main():
         "Qonto · Revolut Business · Shine · Boursorama · N26 · Hello Bank · Fortuneo…  |  "
         "**OCR automatique** via Google Cloud Vision (PDF scannés & Print-to-PDF)"
     )
-
-    gcv_ok = False
-    try:
-        gcv_ok = bool(st.secrets.get("GCV_API_KEY", ""))
-    except Exception:
-        pass
-
-    if not gcv_ok:
-        st.warning(
-            "⚠️ Clé Google Vision non configurée. "
-            "Les PDF scannés / Print-to-PDF nécessitent : "
-            "`GCV_API_KEY` dans `.streamlit/secrets.toml`."
-        )
 
     uploaded = st.file_uploader("📁 Déposer le relevé bancaire (PDF)", type=["pdf"])
     if not uploaded:
