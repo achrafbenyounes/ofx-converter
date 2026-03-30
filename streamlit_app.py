@@ -2319,6 +2319,224 @@ def parse_lcl_text(text: str, year: str | None = None) -> pd.DataFrame:
     return df
 
 
+def parse_lcl_ocr_text(text: str, year: str | None = None) -> pd.DataFrame:
+    """
+    LCL (Crédit Lyonnais) — parser dédié pour PDF scannés / images OCR.
+
+    Variante robuste de parse_lcl_text() adaptée au texte produit par Google
+    Cloud Vision sur des relevés LCL scannés ou imprimés en PDF-image.
+
+    Différences avec le parser texte natif :
+      • Accepte DD.MM et DD/MM comme date opération (OCR peut produire les deux)
+      • Accepte DD.MM.YY, DD.MM.YYYY, DD/MM/YY, DD/MM/YYYY comme date valeur
+      • Le "." colonne (indicateur DÉBIT/CRÉDIT) est optionnel :
+          - Si présent  → logique identique à parse_lcl_text (prioritaire)
+          - Si absent   → détermination par mots-clés LCL, puis heuristique
+      • Ignore les artefacts OCR courants (espaces parasites dans les montants)
+      • Enrichi des préfixes CB23XXXX courants sur LCL (CB23PAYPAL, CB23AMAZON…)
+      • Gère les libellés multi-lignes provenant de l'OCR (mots coupés entre pages)
+
+    Ordre de priorité pour le signe :
+      1. ". MONTANT"  → CRÉDIT  (indicateur colonne préservé par l'OCR)
+      2. "MONTANT ."  → DÉBIT   (indicateur colonne préservé par l'OCR)
+      3. Mots-clés CRÉDIT dans le libellé assemblé
+      4. Mots-clés DÉBIT  dans le libellé assemblé
+      5. Deux montants dans le trailing → avant-dernier = montant réel (dernier = solde)
+      6. Défaut → DÉBIT (conservatisme comptable)
+    """
+    if year is None:
+        ym = re.search(r"(20\d{2})", text)
+        year = ym.group(1) if ym else str(datetime.now().year)
+
+    # ── Tronquer aux totaux / solde final ──
+    stop_pos = len(text)
+    for stop_pat in [r"TOTAUX\s+\d", r"SOLDE\s+EN\s+EUROS"]:
+        for m in re.finditer(stop_pat, text, re.IGNORECASE):
+            stop_pos = min(stop_pos, m.start())
+    text = text[:stop_pos]
+
+    # ── Lignes à ignorer (identique parse_lcl_text + variantes OCR) ──
+    _SKIP = re.compile(
+        r"ECRITURES\s+DE\s+LA\s+PERIODE|DATE\s+LIBELLE|DEBIT\s+CREDIT"
+        r"|ANCIEN\s+SOLDE|SOLDE\s+EN\s+EUROS|SOLDE\s+INTERMEDIAIRE"
+        r"|Page\s+\d|Cr[eé]dit\s+Lyonnais|RELEVE\s+DE"
+        r"|D\.STOCK|Indicatif\s*:|VILLEPARISIS|RELEVE\s+D.IDENTITE"
+        r"|BIC\s*:|IBAN\s*:|votre\s+conseiller|Prenez\s+rendez"
+        r"|du\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s+au|RELEVE\s+DE\s+COMPTE"
+        r"|Banque\s+Indicatif|N°\s+de\s+compte|SIREN\s+\d"
+        r"|MACRO\s+MULTI\s+SERVICES|Indicatif\s*:\s*\d"
+        r"|\bVALEUR\b|\bDATE\b|\bLIBELLE\b|\bDEBIT\b|\bCREDIT\b",
+        re.IGNORECASE,
+    )
+
+    # ── Indicateurs CRÉDIT (entrée d'argent) — enrichis pour OCR ──
+    _CREDIT_RE = re.compile(
+        r"REMISE\s+CB\b"                                      # remise TPE / caisse
+        r"|VERSEMENT\s+ALS\b"                                 # versement espèces
+        r"|VIR\s+(?:SEPA|INST)\s+EDENRED\b"                  # ticket restaurant
+        r"|VIR\s+(?:SEPA|INST)\s+PLUXEE\b"
+        r"|VIR\s+(?:SEPA|INST)\s+UP\s+COOP\b"
+        r"|VIR\s+(?:SEPA|INST)\s+AitKaci\b"
+        r"|VOTRE\s+REMISE\s+SUR\s+PRODUITS"
+        r"|LCL\s+A\s+LA\s+CARTE\s+PRO\s+VOTRE\s+REMISE"
+        # ── Virements reçus (OCR identifié) ──
+        r"|O[\/\\]DE\s+PAIEMENT"                              # virement reçu
+        r"|CIONS[\/\\]O[\/\\]PAIEMT"                         # variante OCR
+        # ── VIR SEPA / VIR INST entrants (heuristique : ni loyer, ni fournisseurs connus) ──
+        r"|VIR\s+SEPA\s+(?!SCI\b|ABADA\b|GCOLLECT\b|BLACK\s+SHIELD|PREFILOC|MALAKOFF|URSSAF|SIE\s+VAL|STRUCTURE|VICRA|ERCINEA)(?!O\s+MEGA\b)(?!SAS\s+YNOV\b)"
+        r"|VIR\s+INST\s+(?!DM\s+INFORMATIQUE|CSI\b|ERCINEA|O\s+MEGA|SAS\s+YNOV|GCOLLECT|RETURN\s+TRADING|THOMAS)",
+        re.IGNORECASE,
+    )
+
+    # ── Indicateurs DÉBIT (sortie d'argent) — enrichis pour OCR ──
+    _DEBIT_RE = re.compile(
+        r"CHQ\.\s*\d"
+        r"|PRLV\s+SEPA\b"                                     # prélèvement automatique
+        r"|COMMISSIONS\s+SUR\s+REMISE"                        # commission bancaire
+        r"|COTISATION\s+(?:MENSUELLE|DE\s+VOTRE)\s+(?:CARTE|OPTION)"
+        r"|COTISATION\s+MENSUELLE\s+CARTE"
+        r"|COTISATION\s+DE\s+VOTRE\s+OPTION\s+PRO"
+        r"|PRLV\s+SEPA\s+B2B\b"
+        r"|ABON\s+LCL"                                        # abonnement LCL
+        # ── CB23XXXX : paiements carte courants sur relevés LCL ──
+        r"|CB23(?:PAYPAL|AMAZON|EBAY|ESSO|APRR|DAC\s+ENI|RELAIS|MAXICOFFEE|AREAS|KFC|COFIROUTE|INPI|SALVA|HOSTINGER|GOOGLE)\b"
+        r"|\bCB23\w+"                                         # fallback tous CB23
+        # ── Virements sortants identifiés ──
+        r"|VIR\s+SEPA\s+(?:SCI\b|ABADA\b|GCOLLECT\b|BLACK\s+SHIELD|PREFILOC|MALAKOFF|URSSAF|SIE\s+VAL|STRUCTURE|VICRA|ERCINEA)"
+        r"|VIR\s+SEPA\s+(?:SAS\s+YNOV|O\s+MEGA)"
+        r"|VIR\s+INST\s+(?:DM\s+INFORMATIQUE|CSI\b|ERCINEA|O\s+MEGA|SAS\s+YNOV|GCOLLECT|RETURN\s+TRADING|THOMAS)",
+        re.IGNORECASE,
+    )
+
+    # ── Regex dates ──
+    # Date opération en début de ligne : DD.MM ou DD/MM (OCR)
+    _DATE_START = re.compile(r"^(\d{2})[\.\/](\d{2})\s+(.+)", re.DOTALL)
+    # Date valeur : DD.MM.YY / DD.MM.YYYY / DD/MM/YY / DD/MM/YYYY
+    _VALEUR_RE  = re.compile(r"\b(\d{2})[\.\/](\d{2})[\.\/](\d{2,4})\b\s*(.*)", re.DOTALL)
+    _AMT_RE     = re.compile(r"(\d[\d\s]*[,\.]\d{2})")
+
+    lines = text.split("\n")
+    transactions: list[dict] = []
+    block: list[str] = []
+
+    def flush_block(blines: list[str]) -> dict | None:
+        if not blines:
+            return None
+        first = blines[0].strip()
+        dm = _DATE_START.match(first)
+        if not dm:
+            return None
+
+        dd, mm, rest = dm.group(1), dm.group(2), dm.group(3)
+
+        # ── Date valeur ──
+        # On cherche d'abord une date avec points (DD.MM.YY) — format natif LCL.
+        # Fallback : slash (DD/MM/YY) — artefact OCR ou date dans un libellé.
+        _VALEUR_DOT = re.compile(r"\b(\d{2})\.(\d{2})\.(\d{2,4})\b\s*(.*)", re.DOTALL)
+        vm = _VALEUR_DOT.search(rest) or _VALEUR_RE.search(rest)
+        if vm:
+            val_yy   = vm.group(3)
+            full_yr  = ("20" + val_yy) if len(val_yy) == 2 else val_yy
+            date_str = f"{dd}/{mm}/{full_yr}"
+            libelle_raw = rest[: vm.start()].strip()
+            trailing    = vm.group(4).strip()
+            # Supprimer toute date résiduelle du trailing (2ème occurrence, artefact OCR)
+            # Ex : "04.11.25 9,89 ." → "9,89 ." après suppression de "04.11.25"
+            trailing = re.sub(r"\b\d{2}[\.\/]\d{2}[\.\/]\d{2,4}\b\s*", "", trailing).strip()
+        else:
+            date_str    = f"{dd}/{mm}/{year}"
+            libelle_raw = rest.strip()
+            trailing    = ""
+
+        # ── Assembler libellé (ligne 1 + continuations) ──
+        extra_parts: list[str] = []
+        for ln in blines[1:]:
+            s = ln.strip()
+            if not s or _SKIP.search(s) or _DATE_START.match(s):
+                continue
+            extra_parts.append(s)
+
+        full_lib = " ".join(p for p in [libelle_raw] + extra_parts if p)
+        full_lib = re.sub(r"\s{2,}", " ", full_lib).strip()[:120]
+
+        # ── Détection du signe via le trailing ──
+        credit_by_dot = re.match(r"^\.\s+(.+)$", trailing)
+        debit_by_dot  = re.search(r"(\d[\d\s]*[,\.]\d{2})\s+\.\s*$", trailing)
+
+        if credit_by_dot:
+            raw_amt = _AMT_RE.search(credit_by_dot.group(1))
+        elif debit_by_dot:
+            raw_amt = _AMT_RE.search(debit_by_dot.group(1))
+        elif trailing:
+            raw_amt = _AMT_RE.search(trailing)
+        else:
+            raw_amt = _AMT_RE.search(libelle_raw)
+            if raw_amt:
+                full_lib = full_lib[: full_lib.rfind(raw_amt.group(0))].strip()
+
+        if not raw_amt:
+            return None
+
+        amount = clean_amount(raw_amt.group(0))
+        if amount is None or amount == 0:
+            return None
+
+        # ── Signe : indicateur "." > mots-clés > heuristique > défaut DÉBIT ──
+        if credit_by_dot:
+            montant = abs(amount)
+        elif debit_by_dot:
+            montant = -abs(amount)
+        else:
+            is_credit = bool(_CREDIT_RE.search(full_lib))
+            is_debit  = bool(_DEBIT_RE.search(full_lib))
+            if is_credit and not is_debit:
+                montant = abs(amount)
+            elif is_debit:
+                montant = -abs(amount)
+            else:
+                # Heuristique OCR : si trailing contient 2 montants,
+                # le dernier est probablement le solde → prendre l'avant-dernier
+                all_amts = [clean_amount(a) for a in _AMT_RE.findall(trailing)]
+                all_amts = [v for v in all_amts if v is not None and v > 0]
+                if len(all_amts) >= 2:
+                    amount = all_amts[-2]
+                montant = -abs(amount)  # débit par défaut
+
+        return {"date": date_str, "libelle": full_lib, "montant": round(montant, 2)}
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if _SKIP.search(stripped):
+            if block:
+                tx = flush_block(block)
+                if tx:
+                    transactions.append(tx)
+                block = []
+            continue
+
+        if _DATE_START.match(stripped):
+            if block:
+                tx = flush_block(block)
+                if tx:
+                    transactions.append(tx)
+            block = [stripped]
+        elif block:
+            block.append(stripped)
+
+    if block:
+        tx = flush_block(block)
+        if tx:
+            transactions.append(tx)
+
+    if not transactions:
+        return pd.DataFrame(columns=["date", "libelle", "montant"])
+    df = pd.DataFrame(transactions)
+    df["montant"] = df["montant"].round(2)
+    return df
+
+
 def parse_transactions_text(text: str, year: str | None = None) -> pd.DataFrame:
     """
     Parser texte universel compatible Qonto et résultat OCR générique.
@@ -2527,6 +2745,78 @@ def _extract_lcl_opening_balance(pdf_bytes: bytes) -> float | None:
 
     except Exception:
         pass
+    return None
+
+
+def _extract_lcl_opening_balance_from_gcv(
+    pages_words: list[list[dict]],
+) -> float | None:
+    """
+    Extrait l'ANCIEN SOLDE LCL depuis les positions de mots Google Cloud Vision.
+
+    Même logique que _extract_lcl_opening_balance() (pdfplumber), mais opère sur
+    les listes de mots GCV déjà normalisées (coordonnées 0-612 x, 0-792 y).
+
+    Sur un relevé LCL scanné :
+      - Solde d'ouverture CRÉDITEUR → montant dans colonne CRÉDIT (x0 ≥ boundary) → +
+      - Solde d'ouverture DÉBITEUR  → montant dans colonne DÉBIT  (x0 < boundary)  → -
+    """
+    for page_words in pages_words:
+        if not page_words:
+            continue
+
+        # ── Détection colonnes DÉBIT / CRÉDIT ──
+        debit_x, credit_x = None, None
+        for w in page_words:
+            txt = w["text"].upper()
+            if re.search(r"D[EÉ]BIT", txt) and not re.search(r"CREDITEUR|DEBUT", txt):
+                if w.get("x0", 0) > 300:
+                    debit_x = w["x0"]
+            if re.search(r"CR[EÉ]DIT", txt) and not re.search(
+                r"CREDITEUR|CREDIT\s+MUTUEL|CREDIT\s+AGRICOLE|CIC", txt
+            ):
+                if w.get("x0", 0) > 380:
+                    credit_x = w["x0"]
+
+        if debit_x is None:
+            debit_x = 437.0
+        if credit_x is None:
+            credit_x = 506.0
+        boundary = (debit_x + credit_x) / 2
+
+        # ── Chercher la ligne ANCIEN SOLDE ──
+        lines_by_y = _group_by_y(page_words, y_tol=2.0)
+        for y_key in sorted(lines_by_y.keys()):
+            line_words = sorted(lines_by_y[y_key], key=lambda w: w["x0"])
+            line_upper = " ".join(w["text"].upper() for w in line_words)
+            if "ANCIEN" not in line_upper or "SOLDE" not in line_upper:
+                continue
+
+            amt_val = _extract_amount_from_zone(line_words, 300.0, 700.0)
+            if amt_val is None:
+                continue
+
+            # Trouver le token principal du montant pour déterminer sa colonne
+            main_amt_word = None
+            for w in reversed(sorted(line_words, key=lambda w: w["x0"])):
+                if re.match(r"^\d{1,4}[,\.]\d{2}$", w["text"].strip()):
+                    main_amt_word = w
+                    break
+
+            if main_amt_word is None:
+                for w in reversed(sorted(line_words, key=lambda w: w["x0"])):
+                    if re.search(r"\d", w["text"]) and w["x0"] > 300:
+                        main_amt_word = w
+                        break
+
+            if main_amt_word is None:
+                return abs(amt_val)  # fallback positif
+
+            if main_amt_word["x0"] >= boundary:
+                return abs(amt_val)    # colonne CRÉDIT → positif
+            else:
+                return -abs(amt_val)   # colonne DÉBIT  → négatif (découvert)
+
     return None
 
 
@@ -3097,23 +3387,42 @@ def extract_all(pdf_file) -> dict:
         # extract_opening_balance() retourne toujours une valeur positive.
         # Or LCL place l'ANCIEN SOLDE en colonne DÉBIT quand le compte est à découvert
         # (solde débiteur) → le solde d'ouverture doit alors être NÉGATIF.
-        # _extract_lcl_opening_balance() lit la position x du montant dans le PDF
-        # pour déterminer le bon signe.
         if has_text:
+            # PDF texte natif : utilise les positions pdfplumber
             lcl_opening = _extract_lcl_opening_balance(pdf_bytes)
             if lcl_opening is not None:
                 opening = lcl_opening
-        # ── LCL — Priorité : parser colonne pdfplumber (DÉBIT | CRÉDIT par position x) ──
-        # Fallback : parser texte dédié LCL (indicateurs "." + mots-clés)
+        elif ocr_used and pages_words:
+            # PDF scanné / image : utilise les positions Google Cloud Vision
+            lcl_opening = _extract_lcl_opening_balance_from_gcv(pages_words)
+            if lcl_opening is not None:
+                opening = lcl_opening
+
+        # ── LCL — Cascade de parsers ──
+        #
+        # PDF texte natif :
+        #   1. Parser colonne pdfplumber (DÉBIT | CRÉDIT par position x)
+        #   2. Parser texte dédié LCL (indicateurs "." + mots-clés)
+        #
+        # PDF scanné / image (OCR Google Cloud Vision) :
+        #   1. Parser colonne GCV (positions x/y normalisées 0-612)
+        #   2. Parser LCL dédié OCR (DD.MM|DD/MM + "." colonne + mots-clés enrichis)
+        #   3. Parser LCL texte natif (si OCR très fidèle à la mise en page)
+        #   4. Parser universel (dernier recours)
         if has_text:
             df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
             if df.empty:
                 df = parse_lcl_text(raw_text, year_ref)
         elif ocr_used and pages_words:
+            # Priorité 1 : parser colonne GCV (exploite les positions x/y)
             df = parse_transactions_from_word_pages(
                 pages_words, year=year_ref, y_tol=4.0
             )
             if df.empty:
+                # Priorité 2 : parser LCL dédié OCR (robuste aux artefacts OCR)
+                df = parse_lcl_ocr_text(raw_text, year_ref)
+            if df.empty:
+                # Priorité 3 : parser LCL texte natif (fonctionne si OCR très fidèle)
                 df = parse_lcl_text(raw_text, year_ref)
         if df.empty:
             df = parse_transactions_text(raw_text, year=year_ref)
