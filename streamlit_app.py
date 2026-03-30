@@ -557,57 +557,20 @@ def parse_shine_text(text: str) -> pd.DataFrame:
     Shine — format texte CSV.
     Colonnes : Date | Type | Opération | Débit (euro) | Crédit (euro)
     Signe    : présence de "De :" dans la ligne → crédit ; sinon → débit.
-
-    Fix multi-pages : le pied de page Shine (ex. "Shine France, SAS au capital de
-    4 446,79 €") s'annexait au dernier bloc de la page 1 et corrompait le montant
-    (amounts[-1] capturait 4 446,79 au lieu du vrai montant de la transaction).
-    Solution : filtrer les lignes de footer/header avant l'accumulation des blocs.
     """
     year = str(datetime.now().year)
     m = re.search(r"Solde au \d{2}/\d{2}/(\d{4})", text)
     if m:
         year = m.group(1)
 
-    # Stopper aux pieds de page (on arrête à "Total des mouvements" en priorité
-    # pour conserver les transactions des pages suivantes avant ce marqueur)
+    # Stopper aux pieds de page
     for stop in [r"Total des mouvements", r"Nouveau solde", r"Shine\s+\(www", r"Shine France"]:
         sm = re.search(stop, text, re.IGNORECASE)
         if sm:
             text = text[: sm.start()]
             break
 
-    # ── FIX multi-pages : filtrer les lignes de pied de page / en-tête Shine ──
-    # Sur un relevé de 2+ pages, pdfplumber concatène les pages. Le footer de la
-    # page N contient "Shine France, SAS au capital de 4 446,79 €" et d'autres
-    # infos avec des montants parasites. Sans filtre, ces lignes s'accumulent dans
-    # le dernier bloc de la page N et faussent l'extraction du montant (amounts[-1]).
-    _SHINE_FOOTER_LINE = re.compile(
-        r'^(?:'
-        r'Relevé\s+d.opérations'                       # en-tête section
-        r'|De\s+\d{2}/\d{2}/\d{4}\s+[àa]\s+\d{2}/\d{2}/\d{4}'  # période "De XX/XX/XXXX à XX/XX/XXXX"
-        r'|Compte\s+professionnel'
-        r'|Nom\s+du\s+compte\s*:'
-        r'|IBAN\s*:'
-        r'|BIC\s*:'
-        r'|Shine\s*\(www'
-        r'|Shine\s+France'
-        r'|122\s+rue\s+Amelot'
-        r'|SIRET\s*:'
-        r'|Messagerie\s*:'
-        r'|Les\s+op[ée]rations\s+[ée]crites'
-        r'|Page\s+\d+/\d+'                             # "Page 1/2"
-        r'|Date\s+Type\s+Op[ée]ration'                 # en-tête de colonne répété page 2
-        r'|\d{3}\s+\d{3}\s+\d{3}\s+\d{5}'             # numéro SIRET seul "828 701 557 00047"
-        r'|numéro\s+\d+'                               # "numéro 71758"
-        r')',
-        re.IGNORECASE,
-    )
-
-    lines = [
-        ln.strip()
-        for ln in text.replace("\r\n", "\n").split("\n")
-        if ln.strip() and not _SHINE_FOOTER_LINE.match(ln.strip())
-    ]
+    lines = [ln.strip() for ln in text.replace("\r\n", "\n").split("\n") if ln.strip()]
     transactions: list[dict] = []
     block: list[str] = []
 
@@ -2135,6 +2098,97 @@ def _group_by_y(words: list[dict], y_tol: float = 2.0) -> dict[float, list[dict]
     return lines
 
 
+def _extract_lcl_opening_balance(pdf_bytes: bytes) -> float | None:
+    """
+    Extrait l'ANCIEN SOLDE LCL en tenant compte de sa colonne (DÉBIT ou CRÉDIT).
+
+    Sur un relevé LCL :
+      - Solde d'ouverture CRÉDITEUR → montant dans la colonne CRÉDIT (x0 > boundary) → positif
+      - Solde d'ouverture DÉBITEUR  → montant dans la colonne DÉBIT  (x0 < boundary) → négatif
+
+    La fonction générique extract_opening_balance() ignore cette position et retourne
+    toujours une valeur positive, ce qui crée un écart quand le compte est à découvert.
+    """
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                words = page.extract_words(keep_blank_chars=False, x_tolerance=3)
+                if not words:
+                    continue
+
+                # ── Détection des colonnes DÉBIT/CRÉDIT ──
+                debit_x, credit_x = None, None
+                for w in words:
+                    txt = w["text"].upper()
+                    if re.search(r"D[EÉ]BIT", txt) and not re.search(r"CREDITEUR|DEBUT", txt):
+                        if w.get("x0", 0) > 300:
+                            debit_x = w["x0"]
+                    if re.search(r"CR[EÉ]DIT", txt) and not re.search(
+                        r"CREDITEUR|CREDIT\s+MUTUEL|CREDIT\s+AGRICOLE|CIC", txt
+                    ):
+                        if w.get("x0", 0) > 380:
+                            credit_x = w["x0"]
+
+                if debit_x is None:
+                    debit_x = 437.0
+                if credit_x is None:
+                    credit_x = 506.0
+                boundary = (debit_x + credit_x) / 2
+
+                # ── Chercher la ligne ANCIEN SOLDE ──
+                lines_by_y = _group_by_y(words, y_tol=2.0)
+                for y_key in sorted(lines_by_y.keys()):
+                    line_words = sorted(lines_by_y[y_key], key=lambda w: w["x0"])
+                    line_upper = " ".join(w["text"].upper() for w in line_words)
+                    if "ANCIEN" not in line_upper or "SOLDE" not in line_upper:
+                        continue
+
+                    # Trouver le montant numérique et sa position x
+                    amount_words = [
+                        w for w in line_words
+                        if re.match(r"^\d[\d\s]*[,\.]\d{2}$", w["text"].strip())
+                        or re.match(r"^\d{1,4}[,\.]\d{2}$", w["text"].strip())
+                        or re.match(r"^\d{1,2}$", w["text"].strip())  # préfixe milliers
+                    ]
+
+                    # Reconstruction montant (ex : "1" + "153,56" → 1153.56)
+                    amt_val = _extract_amount_from_zone(line_words, 300.0, 700.0)
+                    if amt_val is None:
+                        continue
+
+                    # Déterminer la colonne en regardant le mot montant principal
+                    # (le token de type "NNN,NN" le plus à droite du libellé)
+                    main_amt_word = None
+                    for w in reversed(sorted(line_words, key=lambda w: w["x0"])):
+                        if re.match(r"^\d{1,4}[,\.]\d{2}$", w["text"].strip()):
+                            main_amt_word = w
+                            break
+                        # Cas préfixe milliers : le token "NNN,NN" peut être précédé de "N"
+                        if re.match(r"^\d{1,2}$", w["text"].strip()):
+                            # cherche le suivant
+                            pass
+
+                    # Si on n'a pas trouvé de token principal, utiliser le dernier numérique
+                    if main_amt_word is None:
+                        for w in reversed(sorted(line_words, key=lambda w: w["x0"])):
+                            if re.search(r"\d", w["text"]) and w["x0"] > 300:
+                                main_amt_word = w
+                                break
+
+                    if main_amt_word is None:
+                        return abs(amt_val)  # fallback positif
+
+                    # Signe selon la colonne
+                    if main_amt_word["x0"] >= boundary:
+                        return abs(amt_val)   # colonne CRÉDIT → solde positif
+                    else:
+                        return -abs(amt_val)  # colonne DÉBIT  → solde négatif (à découvert)
+
+    except Exception:
+        pass
+    return None
+
+
 def _extract_amount_from_zone(
     line_words: list[dict], col_start: float, col_end: float
 ) -> float | None:
@@ -2697,6 +2751,16 @@ def extract_all(pdf_file) -> dict:
     # ── Dispatch parser ──
 
     if bank == "LCL":
+        # ── Correction solde d'ouverture LCL ──
+        # extract_opening_balance() retourne toujours une valeur positive.
+        # Or LCL place l'ANCIEN SOLDE en colonne DÉBIT quand le compte est à découvert
+        # (solde débiteur) → le solde d'ouverture doit alors être NÉGATIF.
+        # _extract_lcl_opening_balance() lit la position x du montant dans le PDF
+        # pour déterminer le bon signe.
+        if has_text:
+            lcl_opening = _extract_lcl_opening_balance(pdf_bytes)
+            if lcl_opening is not None:
+                opening = lcl_opening
         # ── LCL — Priorité : parser colonne pdfplumber (DÉBIT | CRÉDIT par position x) ──
         # Fallback : parser texte dédié LCL (indicateurs "." + mots-clés)
         if has_text:
