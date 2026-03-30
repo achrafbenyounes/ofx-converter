@@ -565,70 +565,163 @@ def parse_revolut_text(text: str) -> pd.DataFrame:
 
 def parse_shine_text(text: str) -> pd.DataFrame:
     """
-    Shine — format texte CSV.
-    Colonnes : Date | Type | Opération | Débit (euro) | Crédit (euro)
-    Signe    : présence de "De :" dans la ligne → crédit ; sinon → débit.
-    """
-    year = str(datetime.now().year)
-    m = re.search(r"Solde au \d{2}/\d{2}/(\d{4})", text)
-    if m:
-        year = m.group(1)
+    Shine — relevé de compte professionnel multi-pages.
+    Colonnes PDF : Date | Type | Opération | Débit (euro) | Crédit (euro)
 
-    # Stopper aux pieds de page
-    for stop in [r"Total des mouvements", r"Nouveau solde", r"Shine\s+\(www", r"Shine France"]:
+    Bugs résolus (v2) :
+    ─────────────────────────────────────────────────────────────────────────
+    BUG 1 — Stop prématuré :
+      Les patterns "Shine (www.shine.fr)" et "Shine France" apparaissent
+      dans l'en-tête de CHAQUE page (dès la 5ᵉ ligne du document !).
+      L'ancienne logique coupait le texte avant la première transaction.
+      → Supprimés des stop-patterns. On stoppe uniquement sur les totaux
+        de fin ("Total des mouvements", "Nouveau solde") qui n'apparaissent
+        qu'une seule fois, à la dernière page.
+
+    BUG 2 — Lignes de continuation inversées :
+      pdfplumber place les lignes de référence d'un virement AVANT la
+      ligne de date correspondante (comportement spécifique Shine) :
+          "POP SVCS, DOB , 20260202 - ... - Creditor Name SEPA : L Oasis"
+          "09/02/2026 Virement De : STICHTING CUSTODIAN UBER PAYMENTS 2 104,66"
+      L'ancienne logique rattachait ces lignes au bloc PRÉCÉDENT → mauvaise
+      description et potentiellement mauvais montant.
+      → Nouvelle règle : toute ligne non-date est bufferisée dans orphan_before
+        et rattachée au PROCHAIN bloc de date.
+
+    BUG 3 — Pieds de page corrompant les montants :
+      Le pied légal "Shine France, SAS au capital de 4 446,79 €…" était
+      rattaché au dernier bloc de la page → "4 446,79" devenait le montant
+      de la transaction au lieu du vrai montant.
+      → Filtré par _SKIP_SHINE (liste exhaustive des lignes à ignorer).
+
+    Règles de signe :
+      • Présence de "De :" dans le bloc → crédit (virement entrant)
+      • "Frais virement / prélèvement" → toujours débit (frais bancaires)
+      • Tout autre cas → débit
+    ─────────────────────────────────────────────────────────────────────────
+    """
+
+    # ── 1. Stopper au total final (apparaît une seule fois, dernière page) ──
+    for stop in [r"Total des commissions", r"Total des mouvements", r"Nouveau solde"]:
         sm = re.search(stop, text, re.IGNORECASE)
         if sm:
             text = text[: sm.start()]
             break
 
+    # ── 2. Lignes à ignorer — en-têtes et pieds répétés sur chaque page ──
+    _SKIP_SHINE = re.compile(
+        r"^Relev[ée]\s+d[''`']?op[ée]rations"       # "Relevé d'opérations"
+        r"|^De\s+\d{2}/\d{2}/\d{4}\s+[àa]\s+\d{2}/\d{2}/\d{4}"  # "De 01/02/... à 28/02/..."
+        r"|^Compte\s+professionnel"
+        r"|^Shine\s*\("                               # "Shine (www.shine.fr)"
+        r"|^Shine\s+France"                           # "Shine France, SAS au capital..."
+        r"|^Nom\s+du\s+compte"
+        r"|^SIRET\s*:"
+        r"|^IBAN\s*:"
+        r"|^BIC\s*:"
+        r"|^Messagerie\s*:"
+        r"|^Date\s+Type\s+Op[ée]ration"              # en-tête de tableau
+        r"|^Les\s+op[ée]rations\s+[ée]crites"        # mention légale bas de page
+        r"|^Solde\s+au\s+\d{2}/\d{2}/\d{4}"         # solde d'ouverture (pas une transaction)
+        r"|^de\s+paiement"                            # suite notice légale
+        r"|^exploitant\s+le\s+nom"
+        r"|^immatricul[ée]e?"
+        r"|^agr[ée][ée]e?\s+par"
+        r"|^ayant\s+son\s+si[èe]ge"
+        r"|\bSAS\s+au\s+capital\b"                   # "Shine France, SAS au capital..."
+        r"|^122\s+rue\s+Amelot"                       # adresse Shine Paris
+        r"|Page\s+\d+/\d+",                          # "Page 1/2", "Page 2/2"
+        re.IGNORECASE | re.UNICODE,
+    )
+
+    # ── 3. Regex montant : séparateur milliers espace, décimale virgule/point ──
+    #   Capture "2 104,66", "1 365,55", "219,13", "0,48" — pas "20260202"
+    _AMT_RE   = re.compile(r"\b\d{1,3}(?:\s\d{3})*[,\.]\d{2}\b")
+    _FRAIS_RE = re.compile(r"Frais\s+(?:virement|pr[ée]l[eè]vement)", re.IGNORECASE)
+
+    # ── 4. Grouper les lignes en blocs (un bloc = une transaction) ──
+    #
+    # Particularité Shine pdfplumber :
+    #   Les lignes de référence d'un virement (ex : "POP SVCS, DOB…") apparaissent
+    #   AVANT la ligne de date correspondante. Chaque ligne de date est autonome
+    #   (contient type + opération + montant). Il n'existe pas de continuation
+    #   après la date : toute ligne non-date est donc un orphan_before rattaché
+    #   au prochain bloc.
     lines = [ln.strip() for ln in text.replace("\r\n", "\n").split("\n") if ln.strip()]
-    transactions: list[dict] = []
-    block: list[str] = []
-
-    def process_block(blines: list[str]) -> dict | None:
-        if not blines:
-            return None
-        full = " ".join(blines)
-        dm = re.match(r"^(\d{2}/\d{2}/\d{4})\s+", full)
-        if not dm:
-            return None
-        date_str = dm.group(1)
-
-        # Dernier montant numérique de la ligne.
-        # FIX 1 : le regex ne doit PAS autoriser d'espaces internes sur \d{1,8} —
-        # sans quoi "Action 4632 10,67" est capturé comme "4632 10,67" → 463210.67 (faux).
-        # FIX 2 : autoriser les séparateurs de milliers avec espace : "2 104,66", "1 132,97"
-        # → \d{1,3}(?:\s\d{3})* capture correctement "2 104" avant la virgule,
-        #   sans risque de fausse capture sur des chaînes de type "20260202".
-        raw = re.findall(r"\b\d{1,3}(?:\s\d{3})*[,\.]\d{2}\b", full)
-        amounts = [v for a in raw if (v := clean_amount(a)) is not None]
-        if not amounts:
-            return None
-        amount = abs(amounts[-1])
-
-        # Signe : "De :" → crédit (virement reçu), sinon débit
-        is_credit = bool(re.search(r"\bDe\s*:", full, re.IGNORECASE))
-        montant = amount if is_credit else -amount
-
-        desc = full[len(date_str):].strip()
-        # FIX : même correction pour supprimer le montant final (avec séparateur milliers optionnel)
-        desc = re.sub(r"\s*\b\d{1,3}(?:\s\d{3})*[,\.]\d{2}\b\s*$", "", desc).strip()[:120]
-        return {"date": date_str, "libelle": desc, "montant": round(montant, 2)}
+    blocks: list[list[str]] = []
+    current: list[str] | None = None
+    orphan_before: list[str] = []   # lignes de référence précédant la prochaine date
 
     for line in lines:
-        if re.match(r"^\d{2}/\d{2}/\d{4}\b", line):
-            if block:
-                tx = process_block(block)
-                if tx:
-                    transactions.append(tx)
-            block = [line]
-        elif block:
-            block.append(line)
+        if _SKIP_SHINE.search(line):
+            # En-tête / pied de page → flush bloc en cours + reset
+            if current is not None:
+                blocks.append(current)
+                current = None
+            orphan_before = []
+            continue
 
-    if block:
-        tx = process_block(block)
-        if tx:
-            transactions.append(tx)
+        if re.match(r"^\d{2}/\d{2}/\d{4}\b", line):
+            # Nouvelle date → sauvegarder le bloc précédent
+            if current is not None:
+                blocks.append(current)
+            # Nouveau bloc = lignes orphelines accumulées + ligne de date
+            current = orphan_before + [line]
+            orphan_before = []
+        else:
+            # Ligne non-date → bufferiser pour le PROCHAIN bloc (jamais le courant)
+            orphan_before.append(line)
+
+    if current is not None:
+        blocks.append(current)
+
+    # ── 5. Parser chaque bloc ──
+    transactions: list[dict] = []
+
+    for block_lines in blocks:
+        # Identifier la ligne de date et les lignes orphelines
+        date_str   = None
+        main_line  = ""
+        orphan_lines: list[str] = []
+        for bl in block_lines:
+            dm = re.match(r"^(\d{2}/\d{2}/\d{4})\b", bl)
+            if dm and date_str is None:
+                date_str  = dm.group(1)
+                main_line = bl
+            else:
+                orphan_lines.append(bl)
+        if not date_str:
+            continue
+
+        # Texte complet du bloc (pour détection "De :" et extraction montant)
+        full = " ".join(block_lines)
+
+        # Dernier montant = montant de la transaction
+        # (\d{1,3}(?:\s\d{3})* évite de capturer les timestamps "20260202")
+        raw     = _AMT_RE.findall(full)
+        amounts = [v for a in raw if (v := clean_amount(a)) is not None]
+        if not amounts:
+            continue
+        amount = abs(amounts[-1])
+
+        # Signe : "De :" → crédit (virement entrant), SAUF "Frais" → toujours débit
+        is_frais  = bool(_FRAIS_RE.search(full))
+        is_credit = (not is_frais) and bool(re.search(r"\bDe\s*:", full, re.IGNORECASE))
+        montant   = amount if is_credit else -amount
+
+        # Libellé : contenu de la ligne de date (sans date ni montant final)
+        #           suivi des lignes orphelines séparées par " | "
+        main_desc = main_line[len(date_str):].strip()
+        main_desc = re.sub(r"\s*\b\d{1,3}(?:\s\d{3})*[,\.]\d{2}\b\s*$", "", main_desc).strip()
+        extra     = " | ".join(orphan_lines) if orphan_lines else ""
+        desc      = (main_desc + (" | " + extra if extra else "")).strip()
+        desc      = re.sub(r"\s{2,}", " ", desc)[:120]
+
+        transactions.append({
+            "date":    date_str,
+            "libelle": desc,
+            "montant": round(montant, 2),
+        })
 
     if not transactions:
         return pd.DataFrame(columns=["date", "libelle", "montant"])
