@@ -4,7 +4,8 @@ OFX Converter Pro — Multi-banques France → Odoo
 Compatible (relevés texte ET scannés / Print-to-PDF) :
   La Banque Postale · BNP Paribas · Crédit Agricole · Société Générale
   CIC · Crédit Mutuel · LCL · Caisse d'Épargne · Banque Populaire
-  Qonto · Revolut Business · Shine · Boursorama · Hello Bank · N26 · Fortuneo…
+  Qonto · Revolut Business · Shine · Boursorama · Hello Bank · N26 · Fortuneo
+  **Finom** (finom.co / PNL Fintech B.V.)…
 
 OCR : Google Cloud Vision API
   → Configurer GCV_API_KEY dans .streamlit/secrets.toml
@@ -156,6 +157,14 @@ def detect_bank(text: str) -> str:
         return "N26"
     if "SUMERIA" in t or "LYDIA" in t:
         return "SUMERIA"
+    # Finom : BIC propriétaire FNOMFRP2 ou mention "Finom" / "PNL Fintech"
+    if (
+        "FNOMFRP2" in t
+        or "FINOM" in t
+        or "PNL FINTECH" in t
+        or re.search(r"FINOM\.CO|FINOM\s+PAYMENTS", t)
+    ):
+        return "FINOM"
     return "GENERIC"
 
 
@@ -290,6 +299,8 @@ _CLOSING_PATTERNS = [
     r"SOLDE\s+EN\s+EUROS\s+" + _AMT,
     # ── LCL : "SOLDE INTERMEDIAIRE A FIN DECEMBRE 387,68" (solde intermédiaire) ──
     r"SOLDE\s+INTERMEDIAIRE\s+A\s+FIN\s+\w+\s+" + _AMT,
+    # ── Finom : "Solde de clôture : 542,59 €" ──
+    r"[Ss]olde\s+de\s+cl[ôo]ture\s*:?\s*" + _AMT,
 ]
 
 
@@ -621,6 +632,243 @@ def parse_shine_text(text: str) -> pd.DataFrame:
 
     if not transactions:
         return pd.DataFrame(columns=["date", "libelle", "montant"])
+    df = pd.DataFrame(transactions)
+    df["montant"] = df["montant"].round(2)
+    return df
+
+
+def parse_finom_text(text: str, year: str | None = None) -> pd.DataFrame:
+    """
+    Finom (finom.co / PNL Fintech B.V.) — relevé de compte professionnel.
+
+    Structure pdfplumber constatée (relevé multi-colonnes) :
+    ─────────────────────────────────────────────────────────────────────────
+    En-tête   : IBAN + BIC + période + "Solde d'ouverture" + "Solde de clôture"
+    Tableau   : colonnes Terminé | Description | Payer | Solde
+    ─────────────────────────────────────────────────────────────────────────
+    Ligne 1 transaction  : DD/MM/YYYY  DESCRIPTION  [AMOUNT €  BALANCE €]
+    Lignes continuation  : référence paiement (M4XXXXXXX), IBAN: …, BIC: …
+    Dernière ligne bloc  : [AMOUNT €  BALANCE €] (si description multi-ligne)
+    ─────────────────────────────────────────────────────────────────────────
+
+    Règles d'extraction :
+      - Signe EXPLICITE dans la colonne Payer :
+          "151,92 €"    → crédit (positif)
+          "- 1,80 €"    → débit  (négatif) — espace entre "-" et le chiffre
+      - Dernier montant € du bloc   = Solde courant (colonne Solde)  → ignoré
+      - Avant-dernier montant € bloc = montant transaction (colonne Payer)
+      - Transactions listées du plus RÉCENT au plus ANCIEN → liste inversée
+
+    Cas spéciaux gérés :
+      - "1 129,19 €" : séparateur milliers espace/NBSP
+      - "Rapyd Europe MX… IBAN: … BIC: …" : description multi-ligne
+      - PNL Fintech B.V. monthly fee       : débit explicite (signe "-")
+      - PNL Fintech B.V. Cashback          : crédit explicite (pas de signe)
+      - M OU MME … TIMOUMI                  : crédit (virement reçu)
+      - "S.A.S.-METRO FRANCE"              : tiret dans libellé, pas un signe
+      - "Jan 17, 2026 - Jan 28, 2026"      : tiret dans date textuelle, ignoré
+      - TOO GOOD TO GO FRANCE              : crédit (remboursement)
+      - Validation optionnelle via solde courant de chaque transaction
+
+    Format OFX produit : montants signés, dates DD/MM/YYYY, libellés nettoyés.
+    """
+
+    # ── 1. Année de référence ────────────────────────────────────────────────
+    if year is None:
+        for pat in [
+            r"Au\s*:\s*\d{2}/\d{2}/(\d{4})",
+            r"Du\s*:\s*\d{2}/\d{2}/(\d{4})",
+            r"\b(20\d{2})\b",
+        ]:
+            m_y = re.search(pat, text, re.IGNORECASE)
+            if m_y:
+                year = m_y.group(1)
+                break
+        if year is None:
+            year = str(datetime.now().year)
+
+    # ── 2. Délimiter la zone utile ───────────────────────────────────────────
+    # IMPORTANT : stopper UNIQUEMENT sur la mention légale finale (bas de dernière page).
+    # Les watermarks "Créé avec Finom.co N" sont des pieds de page intermédiaires
+    # répétés entre chaque page → ne PAS les utiliser comme stop (ils coupent les pages).
+    sm = re.search(r"FINOM\s+PAYMENTS\s+B\.V\.,?\s+soci", text, re.IGNORECASE)
+    if sm:
+        text = text[:sm.start()]
+
+    # ── 3. Regex montant EUR (signe explicite "- " ou absence de signe) ─────
+    #
+    # Exemples à capturer :
+    #   "151,92 €"       → crédit  (group1=None,  group2="151,92")
+    #   "- 1,80 €"       → débit   (group1="- ",  group2="1,80")
+    #   "1 129,19 €"     → crédit  (group1=None,  group2="1 129,19")
+    #   "- 297,05 €"     → débit   (group1="- ",  group2="297,05")
+    #
+    # Contrainte : le signe "-" DOIT être précédé d'un espace / début de ligne
+    # pour ne PAS capturer les tirets dans les libellés ("S.A.S.-METRO").
+    #
+    # Lookbehind : (?:^|(?<=[\s€])) garantit que le "-" éventuel est isolé.
+    # Le groupe 1 est OPTIONNEL : présent → débit, absent → crédit.
+    _AMT_EUR = re.compile(
+        r"(?:^|(?<=[\s€]))(-\s*)?(\d[\d\xa0\s]*[,\.]\d{2})\s*€",
+        re.MULTILINE,
+    )
+
+    # ── 4. Lignes à sauter entièrement (en-têtes, pieds, numéros de page) ───
+    _SKIP_LINE = re.compile(
+        # En-tête de tableau (répété sur chaque page Finom)
+        r"^Termin[ée]\b"               # "Terminé" seul ET "Terminé Description Payer Solde"
+        r"|^Description$|^Payer$|^Solde$"
+        r"|^Cr[ée][ée]\s+avec\s+Finom"  # watermark bas de page "Créé avec Finom.co N"
+        r"|^finom\s*$"                  # logo texte "finom"
+        r"|^\d+\s*$"                    # numéros de page seuls
+        r"|^FINOM\s+PAYMENTS",          # mention légale footer
+        re.IGNORECASE,
+    )
+
+    # ── 5. Grouper les lignes en blocs (un bloc = une transaction) ──────────
+    lines = [ln.strip() for ln in text.replace("\r\n", "\n").split("\n") if ln.strip()]
+    blocks: list[list[str]] = []
+    current: list[str] = []
+
+    for line in lines:
+        if _SKIP_LINE.search(line):
+            # Flush le bloc en cours si on rencontre un en-tête de page ou watermark
+            if current:
+                blocks.append(current)
+                current = []
+            continue
+        # Ignorer numéros de page seuls (1, 2 … 7)
+        if re.match(r"^\d{1,2}$", line):
+            continue
+        # Chaque bloc commence par une ligne DD/MM/YYYY
+        if re.match(r"^\d{2}/\d{2}/\d{4}\b", line):
+            if current:
+                blocks.append(current)
+            current = [line]
+        elif current:
+            current.append(line)
+
+    if current:
+        blocks.append(current)
+
+    # ── 6. Parser chaque bloc ────────────────────────────────────────────────
+    transactions: list[dict] = []
+
+    for block in blocks:
+        first_line = block[0]
+
+        # ── Date ──
+        dm = re.match(r"^(\d{2}/\d{2}/\d{4})\b", first_line)
+        if not dm:
+            continue
+        date_str = dm.group(1)
+
+        # ── Ignorer les lignes de solde d'ouverture / clôture ──
+        if re.search(
+            r"Solde\s+d[''']ouverture|Solde\s+de\s+cl[ôo]ture|Termin[ée]",
+            first_line, re.IGNORECASE,
+        ):
+            continue
+
+        # ── Trouver tous les montants EUR dans le bloc ──────────────────────
+        # On concatène tout le bloc pour attraper les montants sur n'importe quelle ligne.
+        full_block = " ".join(block)
+
+        amounts: list[float] = []        # montants signés (crédit +, débit -)
+        balances_raw: list[float] = []   # tous montants absolus (pour validation)
+
+        for m_a in _AMT_EUR.finditer(full_block):
+            sign_str = (m_a.group(1) or "").strip()
+            val = clean_amount(m_a.group(2))
+            if val is None:
+                continue
+            signed = -abs(val) if sign_str == "-" else abs(val)
+            amounts.append(signed)
+
+        # ── Nécessite au moins 2 montants (transaction + solde) ─────────────
+        if len(amounts) < 2:
+            # Fallback : une seule ligne simple comme "30/01/2026 APRR - 1,80 € 390,67 €"
+            # Le "-" peut être collé différemment selon le PDF → réessayer en mode permissif
+            amounts_fallback = []
+            for m_fb in re.finditer(
+                r"(-\s*)?((?:\d[\d\xa0\s]*)?[,\.]\d{2}|\d+[,\.]\d{2})\s*€",
+                full_block,
+            ):
+                s = (m_fb.group(1) or "").strip()
+                v = clean_amount(m_fb.group(2))
+                if v is None:
+                    continue
+                amounts_fallback.append(-abs(v) if s == "-" else abs(v))
+            if len(amounts_fallback) >= 2:
+                amounts = amounts_fallback
+            else:
+                continue  # impossible de parser ce bloc
+
+        # Avant-dernier = montant transaction (colonne Payer)
+        # Dernier       = solde courant       (colonne Solde, non utilisé dans OFX)
+        tx_amount = amounts[-2]
+        balance_after = amounts[-1]    # solde après transaction (validation)
+
+        # ── Construction du libellé ─────────────────────────────────────────
+        desc_parts: list[str] = []
+
+        # Première ligne : supprimer la date + les montants EUR
+        rest_first = first_line[len(date_str):].strip()
+        rest_first = _AMT_EUR.sub("", rest_first).strip()
+        rest_first = re.sub(r"\s{2,}", " ", rest_first).strip()
+        if rest_first:
+            desc_parts.append(rest_first)
+
+        # Lignes de continuation (références, IBAN, BIC exclus)
+        for ln in block[1:]:
+            # Exclure les lignes IBAN:/BIC: de la description (bruit)
+            if re.match(r"^(?:IBAN|BIC)\s*:", ln, re.IGNORECASE):
+                continue
+            # Supprimer les montants EUR éventuels en fin de ligne
+            ln_clean = _AMT_EUR.sub("", ln).strip()
+            ln_clean = re.sub(r"\s{2,}", " ", ln_clean).strip()
+            if ln_clean:
+                desc_parts.append(ln_clean)
+
+        desc = " ".join(desc_parts)
+        desc = re.sub(r"\s{2,}", " ", desc).strip()[:120]
+        if not desc:
+            desc = "Transaction Finom"
+
+        transactions.append({
+            "date": date_str,
+            "libelle": desc,
+            "montant": round(tx_amount, 2),
+            "_balance": balance_after,      # utilisé pour validation (supprimé ci-dessous)
+        })
+
+    if not transactions:
+        return pd.DataFrame(columns=["date", "libelle", "montant"])
+
+    # ── 7. Finom liste du plus récent au plus ancien → inverser ─────────────
+    transactions = list(reversed(transactions))
+
+    # ── 8. Validation optionnelle par solde courant ──────────────────────────
+    # Finom affiche le solde après chaque transaction.
+    # On vérifie balance[n] ≈ balance[n-1] + montant[n].
+    # En cas d'anomalie et de montant non signé dans l'original (improbable ici),
+    # on tente l'inversion du signe.
+    prev_bal: float | None = None
+    for tx in transactions:
+        bal = tx["_balance"]
+        if prev_bal is not None:
+            expected = round(prev_bal + tx["montant"], 2)
+            if abs(expected - bal) > 0.10:
+                # Tenter l'inversion
+                inv = round(-tx["montant"], 2)
+                if abs(round(prev_bal + inv, 2) - bal) < 0.10:
+                    tx["montant"] = inv
+        prev_bal = bal
+
+    # Supprimer la colonne de validation temporaire
+    for tx in transactions:
+        tx.pop("_balance", None)
+
     df = pd.DataFrame(transactions)
     df["montant"] = df["montant"].round(2)
     return df
@@ -2682,6 +2930,7 @@ _TEXT_BANKS = {
     "BANQUE_POPULAIRE": parse_banque_populaire_text,
     "CAISSE_EPARGNE": parse_caisse_epargne_text,
     "QONTO": parse_transactions_text,
+    "FINOM": parse_finom_text,
 }
 
 
@@ -3001,7 +3250,7 @@ def main():
     st.caption(
         "Compatible : La Banque Postale · BNP Paribas · Crédit Agricole · Société Générale · "
         "CIC · Crédit Mutuel · LCL · Caisse d'Épargne · Banque Populaire · "
-        "Qonto · Revolut Business · Shine · Boursorama · N26 · Hello Bank · Fortuneo…  |  "
+        "Qonto · Revolut Business · Shine · Boursorama · N26 · Hello Bank · Fortuneo · **Finom**  |  "
         "**OCR automatique** via Google Cloud Vision (PDF scannés & Print-to-PDF)"
     )
 
