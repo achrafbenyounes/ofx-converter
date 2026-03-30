@@ -557,20 +557,57 @@ def parse_shine_text(text: str) -> pd.DataFrame:
     Shine — format texte CSV.
     Colonnes : Date | Type | Opération | Débit (euro) | Crédit (euro)
     Signe    : présence de "De :" dans la ligne → crédit ; sinon → débit.
+
+    Fix multi-pages : le pied de page Shine (ex. "Shine France, SAS au capital de
+    4 446,79 €") s'annexait au dernier bloc de la page 1 et corrompait le montant
+    (amounts[-1] capturait 4 446,79 au lieu du vrai montant de la transaction).
+    Solution : filtrer les lignes de footer/header avant l'accumulation des blocs.
     """
     year = str(datetime.now().year)
     m = re.search(r"Solde au \d{2}/\d{2}/(\d{4})", text)
     if m:
         year = m.group(1)
 
-    # Stopper aux pieds de page
+    # Stopper aux pieds de page (on arrête à "Total des mouvements" en priorité
+    # pour conserver les transactions des pages suivantes avant ce marqueur)
     for stop in [r"Total des mouvements", r"Nouveau solde", r"Shine\s+\(www", r"Shine France"]:
         sm = re.search(stop, text, re.IGNORECASE)
         if sm:
             text = text[: sm.start()]
             break
 
-    lines = [ln.strip() for ln in text.replace("\r\n", "\n").split("\n") if ln.strip()]
+    # ── FIX multi-pages : filtrer les lignes de pied de page / en-tête Shine ──
+    # Sur un relevé de 2+ pages, pdfplumber concatène les pages. Le footer de la
+    # page N contient "Shine France, SAS au capital de 4 446,79 €" et d'autres
+    # infos avec des montants parasites. Sans filtre, ces lignes s'accumulent dans
+    # le dernier bloc de la page N et faussent l'extraction du montant (amounts[-1]).
+    _SHINE_FOOTER_LINE = re.compile(
+        r'^(?:'
+        r'Relevé\s+d.opérations'                       # en-tête section
+        r'|De\s+\d{2}/\d{2}/\d{4}\s+[àa]\s+\d{2}/\d{2}/\d{4}'  # période "De XX/XX/XXXX à XX/XX/XXXX"
+        r'|Compte\s+professionnel'
+        r'|Nom\s+du\s+compte\s*:'
+        r'|IBAN\s*:'
+        r'|BIC\s*:'
+        r'|Shine\s*\(www'
+        r'|Shine\s+France'
+        r'|122\s+rue\s+Amelot'
+        r'|SIRET\s*:'
+        r'|Messagerie\s*:'
+        r'|Les\s+op[ée]rations\s+[ée]crites'
+        r'|Page\s+\d+/\d+'                             # "Page 1/2"
+        r'|Date\s+Type\s+Op[ée]ration'                 # en-tête de colonne répété page 2
+        r'|\d{3}\s+\d{3}\s+\d{3}\s+\d{5}'             # numéro SIRET seul "828 701 557 00047"
+        r'|numéro\s+\d+'                               # "numéro 71758"
+        r')',
+        re.IGNORECASE,
+    )
+
+    lines = [
+        ln.strip()
+        for ln in text.replace("\r\n", "\n").split("\n")
+        if ln.strip() and not _SHINE_FOOTER_LINE.match(ln.strip())
+    ]
     transactions: list[dict] = []
     block: list[str] = []
 
@@ -584,9 +621,12 @@ def parse_shine_text(text: str) -> pd.DataFrame:
         date_str = dm.group(1)
 
         # Dernier montant numérique de la ligne.
-        # FIX : le regex ne doit PAS autoriser d'espaces internes —
+        # FIX 1 : le regex ne doit PAS autoriser d'espaces internes sur \d{1,8} —
         # sans quoi "Action 4632 10,67" est capturé comme "4632 10,67" → 463210.67 (faux).
-        raw = re.findall(r"\b\d{1,8}[,\.]\d{2}\b", full)
+        # FIX 2 : autoriser les séparateurs de milliers avec espace : "2 104,66", "1 132,97"
+        # → \d{1,3}(?:\s\d{3})* capture correctement "2 104" avant la virgule,
+        #   sans risque de fausse capture sur des chaînes de type "20260202".
+        raw = re.findall(r"\b\d{1,3}(?:\s\d{3})*[,\.]\d{2}\b", full)
         amounts = [v for a in raw if (v := clean_amount(a)) is not None]
         if not amounts:
             return None
@@ -597,8 +637,8 @@ def parse_shine_text(text: str) -> pd.DataFrame:
         montant = amount if is_credit else -amount
 
         desc = full[len(date_str):].strip()
-        # FIX : même correction pour supprimer uniquement le montant final (sans espaces internes)
-        desc = re.sub(r"\b\d{1,8}[,\.]\d{2}\s*$", "", desc).strip()[:120]
+        # FIX : même correction pour supprimer le montant final (avec séparateur milliers optionnel)
+        desc = re.sub(r"\s*\b\d{1,3}(?:\s\d{3})*[,\.]\d{2}\b\s*$", "", desc).strip()[:120]
         return {"date": date_str, "libelle": desc, "montant": round(montant, 2)}
 
     for line in lines:
@@ -2251,7 +2291,8 @@ def parse_transactions_from_word_pages(
                 if re.search(
                     r"SOLDE\s+EN\s+EUROS|SOLDE\s+INTERMEDIAIRE|TOTAUX\s+\d"
                     r"|SOLDE\s+CR[EÉ]DITEUR\s+AU|SOLDE\s+D[EÉ]BITEUR\s+AU"
-                    r"|TOTAL\s+DES\s+MOUVEMENTS|TOTAL\s+PREL[EÈ]VE",
+                    r"|TOTAL\s+DES\s+MOUVEMENTS|TOTAL\s+PREL[EÈ]VE"
+                    r"|ANCIEN\s+SOLDE",
                     _line_upper,
                 ):
                     continue
@@ -2672,11 +2713,11 @@ def extract_all(pdf_file) -> dict:
             df = parse_transactions_text(raw_text, year=year_ref)
 
         # ── Filtre de sécurité : supprimer les lignes bilan/totaux LCL
-        # (ex : "SOLDE EN EUROS", "SOLDE INTERMEDIAIRE A FIN DECEMBRE")
+        # (ex : "SOLDE EN EUROS", "SOLDE INTERMEDIAIRE A FIN DECEMBRE", "ANCIEN SOLDE")
         # Ces lignes ne sont pas de vraies transactions et faussent les totaux.
         if not df.empty:
             _lcl_bilan_mask = df["libelle"].str.contains(
-                r"SOLDE\s+EN\s+EUROS|SOLDE\s+INTERMEDIAIRE",
+                r"SOLDE\s+EN\s+EUROS|SOLDE\s+INTERMEDIAIRE|ANCIEN\s+SOLDE",
                 regex=True, flags=re.IGNORECASE, na=False,
             )
             df = df[~_lcl_bilan_mask].reset_index(drop=True)
