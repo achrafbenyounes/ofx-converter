@@ -3648,13 +3648,65 @@ def generate_ofx(
 # =========================================================
 
 def main():
+    
+    st.markdown("""
+        <style>
+            /* Animation douce */
+            @keyframes fadeIn {
+                from {opacity: 0; transform: translateY(10px);}
+                to {opacity: 1; transform: translateY(0);}
+            }
+
+        .block-container {
+            animation: fadeIn 0.6s ease-in-out;
+        }
+
+        /* Boutons plus stylés */
+            .stButton>button {
+                border-radius: 10px;
+                transition: 0.3s;
+            }
+        .stButton>button:hover {
+            transform: scale(1.05);
+        }
+        </style>
+    """, unsafe_allow_html=True)
+    
+    
+    st.sidebar.markdown("""
+        ### 👨‍💻 À propos
+
+        **Achraf BEN YOUNES**  
+        🚀 Data & AI Engineer  
+
+        ---
+
+        📞 **Contact**  
+        🇫🇷 07 60 93 53 71  
+
+        📧 **Email**  
+        achrafbenyounes2012@gmail.com  
+
+        ---
+
+            © 2026 Achraf BEN YOUNES  
+        """)
+    
     st.title("💳 OFX Converter Pro — Multi-banques France → Odoo")
+    
     st.caption(
         "Compatible : La Banque Postale · BNP Paribas · Crédit Agricole · Société Générale · "
         "CIC · Crédit Mutuel · LCL · Caisse d'Épargne · Banque Populaire · "
-        "Qonto · Revolut Business · Shine · Boursorama · N26 · Hello Bank · Fortuneo · **Finom**  |  "
-        "**OCR automatique** via Google Cloud Vision (PDF scannés & Print-to-PDF)"
+        "Qonto · Revolut Business · Shine · **Finom**  |  "
+        "**OCR automatique** (PDF scannés & Print-to-PDF)"
     )
+    
+    st.markdown("""
+        <p style='font-size:16px; color:gray;'>
+        Convertissez automatiquement vos relevés bancaires en format OFX compatible Odoo — 
+        <span style='color:#4CAF50; font-weight:bold;'>rapide, fiable et intelligent</span>.
+        </p>
+        """, unsafe_allow_html=True)
 
     uploaded = st.file_uploader("📁 Déposer le relevé bancaire (PDF)", type=["pdf"])
     if not uploaded:
