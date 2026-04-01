@@ -99,15 +99,66 @@ def is_leading_digit(s: str) -> bool:
 def _normalize_date_str(date_str: str, year: str) -> str:
     """
     Normalise DD/MM, DD.MM, DD/MM/YY, DD.MM.YY, DD/MM/YYYY → DD/MM/YYYY.
+    Valide l'année finale pour éviter les fragments IBAN (ex : "2062") :
+    si l'année extraite est hors plage réaliste ou incohérente avec le relevé,
+    l'année de référence du relevé est utilisée à la place.
     """
     parts = re.split(r"[/\.]", date_str)
     if len(parts) == 2:
         return f"{parts[0]}/{parts[1]}/{year}"
     elif len(parts) == 3:
         if len(parts[2]) == 2:
-            return f"{parts[0]}/{parts[1]}/20{parts[2]}"
-        return f"{parts[0]}/{parts[1]}/{parts[2]}"
+            full_yr = "20" + parts[2]
+        else:
+            full_yr = parts[2]
+        # Validation : cohérence avec l'année du relevé (±1)
+        try:
+            yr_int  = int(full_yr)
+            ref_int = int(year)
+            if not (2000 <= yr_int <= 2099 and abs(yr_int - ref_int) <= 1):
+                full_yr = year
+        except (ValueError, TypeError):
+            full_yr = year
+        return f"{parts[0]}/{parts[1]}/{full_yr}"
     return date_str
+
+
+def _extract_year_from_text(text: str, fallback_year: str | None = None) -> str:
+    """
+    Extrait l'année du relevé depuis le texte OCR/pdfplumber, en évitant les
+    faux positifs provenant des numéros IBAN (ex : "FR47 3000 2062 5200…"
+    contient "2062" qui matcherait un simple re.search(r"20\d{2}")).
+
+    Ordre de priorité :
+      1. Année dans une date complète DD.MM.YYYY ou DD/MM/YYYY
+         → impossible de confondre avec un fragment d'IBAN ou de RIB
+      2. Année dans le contexte "du/au/le DD.MM.YYYY"
+      3. Regex générique 20XX (fallback)
+      4. Année courante
+    """
+    if fallback_year is None:
+        fallback_year = str(datetime.now().year)
+
+    # 1. Date complète : DD.MM.YYYY ou DD/MM/YYYY  (format le plus fiable)
+    m = re.search(r"\b\d{2}[./]\d{2}[./](20\d{2})\b", text)
+    if m:
+        return m.group(1)
+
+    # 2. En-tête de période : "du 01.11.2025 au" ou "au 28.11.2025"
+    m = re.search(
+        r"\b(?:du|au|le)\s+\d{2}[./]\d{2}[./](20\d{2})\b",
+        text,
+        re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+
+    # 3. Fallback générique (peut capturer un fragment d'IBAN — dernier recours)
+    m = re.search(r"(20\d{2})", text)
+    if m:
+        return m.group(1)
+
+    return fallback_year
 
 
 # =========================================================
@@ -639,6 +690,28 @@ def parse_shine_text(text: str) -> pd.DataFrame:
     _AMT_RE   = re.compile(r"\b\d{1,3}(?:\s\d{3})*[,\.]\d{2}\b")
     _FRAIS_RE = re.compile(r"Frais\s+(?:virement|pr[ée]l[eè]vement)", re.IGNORECASE)
 
+    # ── Signaux crédit / débit — utilisés quand le parser colonne n'est pas dispo ──
+    # Virement entrant : "De : INEO…" ; remboursement carte : "Remb", "REFUND"…
+    _CREDIT_SIGNALS = re.compile(
+        r"\bDe\s*:"                                          # virement entrant
+        r"|\bRemb(?:oursement)?\b"                          # remboursement
+        r"|\bAvoir\b"                                        # avoir commercial
+        r"|\bR[eé]gularisation\b"                           # régularisation
+        r"|\bRefund\b"                                       # remboursement anglais
+        r"|\bCashback\b"                                     # cashback
+        r"|\bCr[eé]dit\s+(?!mutuel|agricole|du\s+nord)"    # crédit (hors banques)
+        r"|\bReversal\b",                                    # annulation paiement
+        re.IGNORECASE,
+    )
+    # Signaux débit explicites — priorité sur _CREDIT_SIGNALS
+    _DEBIT_FORCE = re.compile(
+        r"Frais\s+(?:virement|pr[ée]l[eè]vement|paiement|bancaire)"
+        r"|\bPr[ée]l[eè]vement\b"
+        r"|\bCommission\b"
+        r"|\bCotisation\b",
+        re.IGNORECASE,
+    )
+
     # ── 4. Grouper les lignes en blocs (un bloc = une transaction) ──
     #
     # Particularité Shine pdfplumber :
@@ -704,9 +777,9 @@ def parse_shine_text(text: str) -> pd.DataFrame:
             continue
         amount = abs(amounts[-1])
 
-        # Signe : "De :" → crédit (virement entrant), SAUF "Frais" → toujours débit
-        is_frais  = bool(_FRAIS_RE.search(full))
-        is_credit = (not is_frais) and bool(re.search(r"\bDe\s*:", full, re.IGNORECASE))
+        # Signe : "De :" ou signal crédit explicite → crédit, SAUF débit forcé
+        is_debit_forced = bool(_DEBIT_FORCE.search(full))
+        is_credit = (not is_debit_forced) and bool(_CREDIT_SIGNALS.search(full))
         montant   = amount if is_credit else -amount
 
         # Libellé : contenu de la ligne de date (sans date ni montant final)
@@ -1907,6 +1980,15 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
         Ex : VIR RECU sur 4 lignes → montant isolé en dernier
       • Deux colonnes Débit/Crédit sans signe → signe déduit par mots-clés
       • Montants avec séparateur milliers point français : "1.426,32"
+      • pdfplumber fusionne les mots (pas d'espace) : "VIRINSTRE" = "VIR INST RE"
+
+    Terminologie SG des virements (critique pour le signe) :
+      • VIR INST RE  XXXXXXXXX  → Virement Instantané REçu      → CRÉDIT (+)
+        pdfplumber fusionne en "VIRINSTRE653592629181"
+      • VIR INSTANTANE EMIS NET → Virement Instantané Émis      → DÉBIT  (-)
+        pdfplumber fusionne en "VIRINSTANTANEEMISNET"
+      • VIR EUROPEEN EMIS NET   → Virement SEPA Émis            → DÉBIT  (-)
+      • VIR PERM                → Virement Permanent            → DÉBIT  (-)
 
     Stratégie :
       1. Grouper les lignes en blocs (nouveau bloc = ligne commençant par DD/MM/YYYY)
@@ -1941,7 +2023,8 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
         r"|BGSY\d"                             # timbre ADEME (ex: BGSY10_527132RF)
         r"|^:\s*$"                             # ligne avec seulement ":"
         r"|^°N\s*$"                            # fragment "°N" du timbre N° ADEME
-        r"|^EMEDA\s*$"                         # fragment "EMEDA" du timbre ADEME
+        r"|^:?\s*EMEDA\s*$"                    # "EMEDA" ou ": EMEDA" (pages 2-3, timbre ADEME)
+        r"|\d{6}AR\s*$"                        # code marge pages 2-3 ex: "720624AR"
         r"|PROGRAMME\s*DE\s*FID[EÉ]LIT[EÉ]"  # pied de page fidélité
         r"|Montant\s*cumul[eé]\s*des\s*d[eé]penses"
         r"|Rappel\s*des\s*seuils\s*de\s*d[eé]clenchement"
@@ -1955,8 +2038,13 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
     # Indicateurs de CRÉDIT (montant positif)
     # Couvre : remises CB, virements reçus (EDENRED, MARKET PAY, SWILE, Deliveroo,
     # Uber, Pluxee, UP COOP, TotalEnergies remboursement, ANCV/DRFIP…)
+    # NOTE: \s* partout car pdfplumber fusionne les mots sans espace.
     _CREDIT_RE = re.compile(
         r"REMISE\s*CB"                        # REMISE CB ou REMISECB (pdfplumber fusionne)
+        r"|VIR\s*INST\s*RE"                  # ← FIX PRINCIPAL : VIR INST RE XXXXXXXXX
+                                              #   = virement instantané REÇU (crédit entrant)
+                                              #   pdfplumber fusionne → "VIRINSTRE653592629181"
+                                              #   ≠ "VIR INSTANTANE EMIS" / "VIR INST EMIS" (débit)
         r"|VIR\s*RECU"                        # VIR RECU ou VIRRECU
         r"|VIR\s*REC[\xc7U]"                 # variante avec accent
         r"|REMBOURSEMENT\s*PRLV"
@@ -1988,7 +2076,9 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
         r"|VIR\s*PERM\b"
         r"|CHEQUE\b"
         r"|CIONS\s*TENUE"                        # CIONS TENUE ou CIONSTENUE
-        r"|COTIS(?:ATION)?\b"
+        r"|COTIS(?:ATION)?"                     # COTISATION, COTIS… (sans \b : pdfplumber fusionne
+                                                # ex: "COTISATIONMENSUELLEJAZZPRO" sans espace)
+        r"|ABONNEMENT\s*MATERIEL"               # loyer TPE / matériel (ex: ABONNEMENTMATERIEL)
         r"|INT\s*D[EÉ]BITEURS",
         re.IGNORECASE,
     )
@@ -2145,8 +2235,7 @@ def parse_lcl_text(text: str, year: str | None = None) -> pd.DataFrame:
       (d) Défaut                            → DÉBIT  (conservatisme comptable)
     """
     if year is None:
-        ym = re.search(r"(20\d{2})", text)
-        year = ym.group(1) if ym else str(datetime.now().year)
+        year = _extract_year_from_text(text)
 
     # Tronquer au premier parmi : "TOTAUX \d…" ou "SOLDE EN EUROS".
     # NB : "SOLDE INTERMEDIAIRE" est intentionnellement exclu car une vraie
@@ -2158,6 +2247,9 @@ def parse_lcl_text(text: str, year: str | None = None) -> pd.DataFrame:
     text = text[:stop_pos]
 
     # Lignes à ignorer
+    # NOTE : on ne skippe PAS les lignes "LIBELLE:...", "REF.CLIENT:...", "ID.CREANCIER:..."
+    # qui sont des continuations valides de transactions SEPA multi-lignes.
+    # "\bLIBELLE\b" est donc remplacé par "DATE\s+LIBELLE" (en-tête de colonne uniquement).
     _SKIP = re.compile(
         r"ECRITURES\s+DE\s+LA\s+PERIODE|DATE\s+LIBELLE|DEBIT\s+CREDIT"
         r"|ANCIEN\s+SOLDE|SOLDE\s+EN\s+EUROS|SOLDE\s+INTERMEDIAIRE"
@@ -2196,7 +2288,8 @@ def parse_lcl_text(text: str, year: str | None = None) -> pd.DataFrame:
         r"|VIR\s+SEPA\s+ABADA\b"                             # salaire versé
         r"|VIR\s+INST\s+Odeon\b"                             # paiement fournisseur
         r"|VIR\s+INST\s+Desjardins\b"                        # paiement fournisseur
-        r"|COTISATION\s+DE\s+VOTRE\s+OPTION\s+PRO",
+        r"|COTISATION\s+DE\s+VOTRE\s+OPTION\s+PRO"
+        r"|VIR\s+SEPA\s+GAN\s+ASS",                          # assurance prélèvement
         re.IGNORECASE,
     )
 
@@ -2226,7 +2319,17 @@ def parse_lcl_text(text: str, year: str | None = None) -> pd.DataFrame:
         if vm:
             val_yy  = vm.group(3)
             full_yr = ("20" + val_yy) if len(val_yy) == 2 else val_yy
-            date_str = f"{dd}/{mm}/{full_yr}"
+            # Validation : l'année doit être dans une plage réaliste (2000-2099)
+            # et cohérente avec l'année du relevé (±1 an max).
+            # Cela évite de capturer des fragments d'IBAN comme "2062".
+            try:
+                yr_int  = int(full_yr)
+                ref_int = int(year)
+                if not (2000 <= yr_int <= 2099 and abs(yr_int - ref_int) <= 1):
+                    full_yr = year
+            except (ValueError, TypeError):
+                full_yr = year
+            date_str    = f"{dd}/{mm}/{full_yr}"
             libelle_raw = rest[: vm.start()].strip()
             trailing    = vm.group(4).strip()          # tout ce qui suit la date valeur
         else:
@@ -2345,8 +2448,7 @@ def parse_lcl_ocr_text(text: str, year: str | None = None) -> pd.DataFrame:
       6. Défaut → DÉBIT (conservatisme comptable)
     """
     if year is None:
-        ym = re.search(r"(20\d{2})", text)
-        year = ym.group(1) if ym else str(datetime.now().year)
+        year = _extract_year_from_text(text)
 
     # ── Tronquer aux totaux / solde final ──
     stop_pos = len(text)
@@ -2356,6 +2458,8 @@ def parse_lcl_ocr_text(text: str, year: str | None = None) -> pd.DataFrame:
     text = text[:stop_pos]
 
     # ── Lignes à ignorer (identique parse_lcl_text + variantes OCR) ──
+    # NOTE : "\bLIBELLE\b" supprimé — les lignes "LIBELLE:..." sont des continuations
+    # SEPA valides. Seul "DATE LIBELLE" (en-tête de colonne) est skippé.
     _SKIP = re.compile(
         r"ECRITURES\s+DE\s+LA\s+PERIODE|DATE\s+LIBELLE|DEBIT\s+CREDIT"
         r"|ANCIEN\s+SOLDE|SOLDE\s+EN\s+EUROS|SOLDE\s+INTERMEDIAIRE"
@@ -2365,11 +2469,18 @@ def parse_lcl_ocr_text(text: str, year: str | None = None) -> pd.DataFrame:
         r"|du\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s+au|RELEVE\s+DE\s+COMPTE"
         r"|Banque\s+Indicatif|N°\s+de\s+compte|SIREN\s+\d"
         r"|MACRO\s+MULTI\s+SERVICES|Indicatif\s*:\s*\d"
-        r"|\bVALEUR\b|\bDATE\b|\bLIBELLE\b|\bDEBIT\b|\bCREDIT\b",
+        r"|\bVALEUR\b|\bDATE\b|\bDEBIT\b|\bCREDIT\b",
         re.IGNORECASE,
     )
 
     # ── Indicateurs CRÉDIT (entrée d'argent) — enrichis pour OCR ──
+    #
+    # RÈGLE : un VIR SEPA / VIR INST est CRÉDIT sauf s'il figure dans la liste
+    # d'exceptions DÉBIT ci-dessous.  La liste est intentionnellement courte pour
+    # éviter les faux-négatifs : seuls les libellés CLAIREMENT sortants (loyers,
+    # cotisations sociales, fournisseurs récurrents identifiés) sont exclus.
+    # Les cas ambigus (même bénéficiaire pouvant être créditeur ou débiteur selon
+    # le mois) sont laissés à l'indicateur "." colonne, prioritaire sur les mots-clés.
     _CREDIT_RE = re.compile(
         r"REMISE\s+CB\b"                                      # remise TPE / caisse
         r"|VERSEMENT\s+ALS\b"                                 # versement espèces
@@ -2379,12 +2490,17 @@ def parse_lcl_ocr_text(text: str, year: str | None = None) -> pd.DataFrame:
         r"|VIR\s+(?:SEPA|INST)\s+AitKaci\b"
         r"|VOTRE\s+REMISE\s+SUR\s+PRODUITS"
         r"|LCL\s+A\s+LA\s+CARTE\s+PRO\s+VOTRE\s+REMISE"
-        # ── Virements reçus (OCR identifié) ──
-        r"|O[\/\\]DE\s+PAIEMENT"                              # virement reçu
-        r"|CIONS[\/\\]O[\/\\]PAIEMT"                         # variante OCR
-        # ── VIR SEPA / VIR INST entrants (heuristique : ni loyer, ni fournisseurs connus) ──
-        r"|VIR\s+SEPA\s+(?!SCI\b|ABADA\b|GCOLLECT\b|BLACK\s+SHIELD|PREFILOC|MALAKOFF|URSSAF|SIE\s+VAL|STRUCTURE|VICRA|ERCINEA)(?!O\s+MEGA\b)(?!SAS\s+YNOV\b)"
-        r"|VIR\s+INST\s+(?!DM\s+INFORMATIQUE|CSI\b|ERCINEA|O\s+MEGA|SAS\s+YNOV|GCOLLECT|RETURN\s+TRADING|THOMAS)",
+        # ── Virements reçus identifiés par le libellé OCR ──
+        r"|O[\/\\]DE\s+PAIEMENT"                              # ordre de paiement reçu (CRÉDIT)
+        r"|VIR\s+EI\b"                                        # virement entrant individuel (CRÉDIT)
+        r"|VIR\s+INST\s+EI\b"                                 # virement entrant (CRÉDIT)
+        # NB : CIONS/O/PAIEMT est une commission de paiement → DÉBIT (retiré de cette liste)
+        # ── VIR SEPA entrants : tout sauf les sorties connues ──
+        # Exclusions DÉBIT confirmées : loyers SCI, cotisations sociales, fournisseurs récurrents
+        r"|VIR\s+SEPA\s+(?!SCI\b|ABADA\b|GCOLLECT\b|PREFILOC|MALAKOFF|URSSAF|SIE\s+VAL|ERCINEA|GAN\s+ASS)(?!O\s+MEGA\b)(?!SAS\s+YNOV\b)"
+        # ── VIR INST entrants : tout sauf les sorties connues ──
+        # NB : THOMAS retiré de la liste d'exclusion — VIR INST d'un particulier = crédit reçu
+        r"|VIR\s+INST\s+(?!DM\s+INFORMATIQUE|CSI\b|ERCINEA|O\s+MEGA|SAS\s+YNOV|GCOLLECT|RETURN\s+TRADING)",
         re.IGNORECASE,
     )
 
@@ -2398,13 +2514,15 @@ def parse_lcl_ocr_text(text: str, year: str | None = None) -> pd.DataFrame:
         r"|COTISATION\s+DE\s+VOTRE\s+OPTION\s+PRO"
         r"|PRLV\s+SEPA\s+B2B\b"
         r"|ABON\s+LCL"                                        # abonnement LCL
+        r"|CIONS[\/\\]O[\/\\]PAIEMT"                          # commission sur paiement (DÉBIT)
         # ── CB23XXXX : paiements carte courants sur relevés LCL ──
         r"|CB23(?:PAYPAL|AMAZON|EBAY|ESSO|APRR|DAC\s+ENI|RELAIS|MAXICOFFEE|AREAS|KFC|COFIROUTE|INPI|SALVA|HOSTINGER|GOOGLE)\b"
         r"|\bCB23\w+"                                         # fallback tous CB23
         # ── Virements sortants identifiés ──
-        r"|VIR\s+SEPA\s+(?:SCI\b|ABADA\b|GCOLLECT\b|BLACK\s+SHIELD|PREFILOC|MALAKOFF|URSSAF|SIE\s+VAL|STRUCTURE|VICRA|ERCINEA)"
+        r"|VIR\s+SEPA\s+(?:SCI\b|ABADA\b|GCOLLECT\b|PREFILOC|MALAKOFF|URSSAF|SIE\s+VAL|ERCINEA|GAN\s+ASS)"
         r"|VIR\s+SEPA\s+(?:SAS\s+YNOV|O\s+MEGA)"
-        r"|VIR\s+INST\s+(?:DM\s+INFORMATIQUE|CSI\b|ERCINEA|O\s+MEGA|SAS\s+YNOV|GCOLLECT|RETURN\s+TRADING|THOMAS)",
+        # NB : THOMAS retiré — un virement reçu d'un particulier est un crédit
+        r"|VIR\s+INST\s+(?:DM\s+INFORMATIQUE|CSI\b|ERCINEA|O\s+MEGA|SAS\s+YNOV|GCOLLECT|RETURN\s+TRADING)",
         re.IGNORECASE,
     )
 
@@ -2437,7 +2555,17 @@ def parse_lcl_ocr_text(text: str, year: str | None = None) -> pd.DataFrame:
         if vm:
             val_yy   = vm.group(3)
             full_yr  = ("20" + val_yy) if len(val_yy) == 2 else val_yy
-            date_str = f"{dd}/{mm}/{full_yr}"
+            # Validation : l'année doit être dans une plage réaliste (2000-2099)
+            # et cohérente avec l'année du relevé (±1 an max).
+            # Évite les fragments IBAN comme "2062" extraits à tort.
+            try:
+                yr_int  = int(full_yr)
+                ref_int = int(year)
+                if not (2000 <= yr_int <= 2099 and abs(yr_int - ref_int) <= 1):
+                    full_yr = year
+            except (ValueError, TypeError):
+                full_yr = year
+            date_str    = f"{dd}/{mm}/{full_yr}"
             libelle_raw = rest[: vm.start()].strip()
             trailing    = vm.group(4).strip()
             # Supprimer toute date résiduelle du trailing (2ème occurrence, artefact OCR)
@@ -2627,23 +2755,40 @@ def _detect_columns(words: list[dict]) -> tuple[float, float, float, float]:
     Détecte les positions x des colonnes Débit / Crédit depuis les mots d'en-tête.
     Supporte : DEBIT/CREDIT, Débit/Crédit, Débit EUROS/Crédit EUROS.
     Fallback : positions standard La Banque Postale.
+
+    Correction borne (v2) :
+      On utilise x1 (bord DROIT) du mot "Débit" et x0 (bord GAUCHE) du mot "Crédit"
+      pour calculer la borne de séparation. L'ancienne formule (debit_x0 + credit_x0)/2
+      plaçait la borne trop à gauche sur les relevés Shine (et variantes), créant une
+      zone de chevauchement où les montants débit à x0≈482 tombaient dans les deux
+      colonnes → résolution erronée « Crédit » par le tiebreaker.
+      Avec (debit_x1 + credit_x0)/2, la borne est exactement dans l'espace vide entre
+      les deux colonnes → aucun chevauchement.
     """
     debit_x, credit_x = None, None
+    debit_x1: float | None = None   # bord DROIT du mot "Débit" dans l'en-tête
+
     for w in words:
         txt = w["text"].upper()
         # Match DEBIT / DÉBIT mais pas CREDITEUR
         if re.search(r"D[EÉ]BIT", txt) and not re.search(r"CREDITEUR|CL[ÔO]TURE|DEBUT", txt):
             if w.get("x0", 0) > 300:
-                debit_x = w["x0"]
+                debit_x  = w["x0"]
+                debit_x1 = w.get("x1", w["x0"])   # bord droit du header "Débit"
         if re.search(r"CR[EÉ]DIT", txt) and not re.search(r"CREDITEUR|CREDIT\s+MUTUEL|CREDIT\s+AGRICOLE|CIC", txt):
             if w.get("x0", 0) > 380:
                 credit_x = w["x0"]
 
     if debit_x is None:
-        debit_x = 437.0
+        debit_x  = 437.0
+        debit_x1 = 437.0
     if credit_x is None:
         credit_x = 506.0
-    boundary = (debit_x + credit_x) / 2
+
+    # Borne = milieu entre bord droit de "Débit" et bord gauche de "Crédit"
+    # → élimine la zone de chevauchement que (debit_x0+credit_x0)/2 créait
+    _debit_right = debit_x1 if debit_x1 is not None else debit_x
+    boundary = (_debit_right + credit_x) / 2
     desc_end_x = debit_x - 5
     return desc_end_x, debit_x, credit_x, boundary
 
@@ -2867,11 +3012,29 @@ def _extract_amount_from_zone(
 
 
 def _is_header_or_total_line(words: list[dict]) -> bool:
-    """Vrai si la ligne ressemble à un en-tête de tableau ou un total."""
+    """
+    Vrai si la ligne ressemble à un en-tête de tableau ou un total.
+
+    IMPORTANT — ne pas confondre avec les lignes de référence SEPA qui
+    commencent par "LIBELLE:" (ex: "LIBELLE:Reecive G3W2L9") ou par
+    "REF.CLIENT:", "ID.CREANCIER:", "REF.MANDAT:".
+    Ces lignes sont des continuations valides d'une transaction LCL/BNP.
+    Le mot LIBELLE ne doit matcher QUE lorsqu'il est suivi d'un espace
+    ou d'une fin de ligne (en-tête de colonne), PAS lorsqu'il est suivi
+    de ":" (référence SEPA).
+    """
     txt = " ".join(w["text"].upper() for w in words)
+    # Exclure les lignes purement composées de références SEPA
+    if re.match(
+        r"^(?:LIBELLE:|REF\.CLIENT:|REF\.MANDAT:|ID\.CREANCIER:|MANDAT:)",
+        txt, re.IGNORECASE,
+    ):
+        return False
     return bool(re.search(
-        r"\b(DATE|VALEUR|NATURE|OPERATION|DEBIT|CREDIT|LIBELLE|TOTAL|TOTAUX"
-        r"|SOLDE|SOUS.TOTAL|REPORT|SUITE)\b",
+        r"\b(DATE|VALEUR|NATURE|OPERATION|DEBIT|CREDIT|TOTAL|TOTAUX"
+        r"|SOLDE|SOUS.TOTAL|REPORT|SUITE)\b"
+        # LIBELLE uniquement comme en-tête de colonne (pas suivi de ":")
+        r"|\bLIBELLE\b(?!\s*:)",
         txt,
     ))
 
@@ -2901,11 +3064,10 @@ def parse_transactions_from_word_pages(
         if not page_words:
             continue
 
-        # Année depuis le texte de la page
+        # Année depuis le texte de la page — utilise le helper sécurisé
+        # (évite de capturer un fragment IBAN comme "2062")
         page_text = " ".join(w["text"] for w in page_words)
-        ym = re.search(r"(20\d{2})", page_text)
-        if ym:
-            year = ym.group(1)
+        year = _extract_year_from_text(page_text, fallback_year=year)
 
         # ── Crédit Mutuel / section carte : exclure les mots SOUS la ligne
         # "RELEVE DE VOTRE CARTE" (détail carte déjà consolidé en "RELEVE CARTE") ──
@@ -2936,6 +3098,17 @@ def parse_transactions_from_word_pages(
             nonlocal current_date, current_desc, current_debit, current_credit
             if current_date is None:
                 return
+            # ── Résolution de l'ambiguïté débit/crédit ──
+            # Si les deux zones ont un montant (can happen when x0 is near boundary),
+            # on choisit le montant dont la valeur est la plus éloignée de zéro
+            # (heuristique : le "vrai" montant est généralement plus grand que 0).
+            # En cas d'égalité, le crédit est favorisé (moins de risque d'erreur
+            # que d'écraser un crédit en débit).
+            if (current_debit is not None and current_debit > 0
+                    and current_credit is not None and current_credit > 0):
+                # Les deux colonnes ont un montant → probable chevauchement de zones.
+                # Conserver uniquement le crédit (moins susceptible d'être un artefact).
+                current_debit = None
             if current_debit is not None and current_debit > 0:
                 amount = -abs(current_debit)
             elif current_credit is not None and current_credit > 0:
@@ -2977,7 +3150,11 @@ def parse_transactions_from_word_pages(
                     r"SOLDE\s+EN\s+EUROS|SOLDE\s+INTERMEDIAIRE|TOTAUX\s+\d"
                     r"|SOLDE\s+CR[EÉ]DITEUR\s+AU|SOLDE\s+D[EÉ]BITEUR\s+AU"
                     r"|TOTAL\s+DES\s+MOUVEMENTS|TOTAL\s+PREL[EÈ]VE"
-                    r"|ANCIEN\s+SOLDE",
+                    r"|ANCIEN\s+SOLDE"
+                    # ── Shine : ligne de solde d'ouverture "Solde au 31/01/2026 59 436,61 €"
+                    #    Elle porte une vraie date DD/MM/YYYY et un montant → serait capturée
+                    #    comme transaction sans ce filtre explicite.
+                    r"|SOLDE\s+AU\b",
                     _line_upper,
                 ):
                     continue
@@ -3024,10 +3201,119 @@ def parse_transactions_from_word_pages(
     return df
 
 
-def parse_transactions_by_column(pdf_file) -> pd.DataFrame:
+def _prefilter_shine_words(pages_words: list[list[dict]]) -> list[list[dict]]:
     """
-    Parser colonne via pdfplumber — extrait les mots avec positions et appelle
-    parse_transactions_from_word_pages.
+    Filtre les mots pdfplumber d'un relevé Shine avant de les passer au parser colonne.
+
+    Shine répète sur CHAQUE page les blocs suivants (en-tête + pied légal) qui ne
+    sont PAS des transactions. Sans filtrage, ces lignes contaminent les libellés :
+
+      — En-têtes répétés : "Relevé d'opérations", "De 01/02/… à 28/02/…",
+        "Compte professionnel", "Nom du compte", "IBAN", "BIC", "SIRET",
+        "Messagerie", adresse client, adresse Shine, "Date Type Opération…"
+
+      — Pieds légaux    : "Shine France, SAS au capital de 4 446,79 €…",
+        "de paiement", "exploitant le nom commercial Shine",
+        "Les opérations écrites en italique…", "Page 1/2"
+
+      — Colonne Type multi-ligne : pdfplumber extrait parfois le type d'opération
+        ("Virement", "instantané", "Prélèvement") SUR UNE LIGNE SÉPARÉE précédant
+        la ligne de date correspondante. Sans filtrage, ce mot se retrouve dans le
+        libellé de la transaction précédente.
+
+    Stratégie : on groupe les mots par y-clé (arrondi à 2 pts), on reconstruit le
+    texte de chaque ligne, et on supprime les lignes dont le texte correspond à un
+    pattern de saut.  Les mots restants sont retournés page par page.
+    """
+    # Patterns de lignes à éliminer — miroir exact de _SKIP_SHINE dans parse_shine_text,
+    # adaptés pour matcher sur la ligne reconstruite depuis les mots pdfplumber.
+    _SKIP_LINE = re.compile(
+        r"^Relev[ée]\s+d[''`']?op[ée]rations"
+        r"|^De\s+\d{2}/\d{2}/\d{4}\s+[àa]\s+\d{2}/\d{2}/\d{4}"
+        r"|^Compte\s+professionnel"
+        r"|^Shine\s*(?:\(|France)"
+        r"|^Nom\s+du\s+compte"
+        r"|^SIRET\s*:"
+        r"|^IBAN\s*:"
+        r"|^BIC\s*:"
+        r"|^Messagerie\s*:"
+        # ⚠️ NE PAS filtrer "Date Type Opération Débit Crédit" → nécessaire pour _detect_columns
+        # Cette ligne est ignorée en tant que transaction par _is_header_or_total_line
+        r"|^Les\s+op[ée]rations\s+[ée]crites"
+        r"|^de\s+paiement"
+        r"|\bexploitant\s+le\s+nom\b"        # sans ^ : la ligne peut commencer par "828 701 557,"
+        r"|^immatricul[ée]e?"
+        r"|^agr[ée][ée]e?\s+par"
+        r"|^ayant\s+son\s+si[èe]ge"
+        r"|\bSAS\s+au\s+capital\b"
+        r"|^122\s+rue\s+Amelot"
+        r"|^25\s+RUE\s+DE\s+LA\s+LIB"       # adresse client
+        r"|^828\s+701\s+557"                  # continuation légale "828 701 557, exploitant…"
+        r"|Page\s+\d+/\d+"
+        # ── Solde d'ouverture "Solde au DD/MM/YYYY …" → pas une transaction ──
+        r"|^Solde\s+au\s+\d{2}/\d{2}/\d{4}"
+        # ── Mots de type isolés (Shine multi-ligne) : "Virement" / "instantané"
+        #    Ils précèdent la ligne de date correspondante et contamineraient
+        #    le libellé de la transaction précédente si on les laissait passer.
+        r"|^(?:Virement|instantan[ée]|Pr[ée]l[eè]vement|Cart[e]?)$",
+        re.IGNORECASE | re.UNICODE,
+    )
+
+    # ── Regex pour détecter si une ligne (reconstruite) contient un montant ──
+    # Utilisée pour identifier les lignes-description orphelines multi-lignes :
+    # ex. "MALAKOFF HUMANIS - RETRAITE - MALAKOFF HUMANIS - 202601M - SIRET"
+    # Ces lignes apparaissent AVANT la date de la transaction suivante mais APRÈS
+    # la date de la transaction précédente → elles contaminent le libellé précédent.
+    # On les filtre si : pas de date, pas de montant ≥ 1,00 dans les colonnes Débit/Crédit.
+    # ⚠️ On ne filtre PAS les lignes de référence SEPA utiles (REF:, LIBELLE:, /FAC/…)
+    _ORPHAN_DESC_RE = re.compile(
+        r"^(?:"
+        r"[A-Z][A-Z0-9\s\-\*\./&,'éèêàùûîôäëïüç]+"  # texte alphanumèrique seul
+        r")\s*-\s*(?:SIRET|RUM|RCS|REF|MANDAT|IBAN)\b",  # suivi d'un mot-clé administratif
+        re.IGNORECASE,
+    )
+
+    filtered: list[list[dict]] = []
+    for page_words in pages_words:
+        if not page_words:
+            filtered.append([])
+            continue
+
+        # Grouper par y-clé (même tolérance que le parser colonne)
+        by_y: dict[float, list[dict]] = {}
+        for w in page_words:
+            k = round(w["top"] / 2) * 2
+            by_y.setdefault(k, []).append(w)
+
+        # Identifier les y-clés des lignes à supprimer
+        skip_ys: set[float] = set()
+        for yk, ws in by_y.items():
+            line_text = " ".join(w["text"] for w in sorted(ws, key=lambda w: w["x0"]))
+            if _SKIP_LINE.search(line_text) or _ORPHAN_DESC_RE.search(line_text):
+                skip_ys.add(yk)
+
+        kept = [w for w in page_words if round(w["top"] / 2) * 2 not in skip_ys]
+        filtered.append(kept)
+
+    return filtered
+
+
+def parse_transactions_by_column_shine(pdf_file, y_tol: float = 3.0) -> pd.DataFrame:
+    """
+    Variante du parser colonne dédiée aux relevés Shine.
+
+    Ajoute un pré-filtrage des mots pdfplumber via _prefilter_shine_words afin
+    d'éliminer avant analyse :
+      • les en-têtes répétés page par page (IBAN, BIC, adresse, "Relevé d'opérations"…)
+      • les pieds légaux ("Shine France, SAS au capital…", "Page X/Y"…)
+      • la ligne "Solde au DD/MM/YYYY …" (solde d'ouverture, pas une transaction)
+      • les mots de type isolés ("Virement", "instantané") qui apparaissent sur une
+        ligne séparée avant la date correspondante et contamineraient le libellé
+        de la transaction précédente.
+
+    y_tol=3.0 : tolérance verticale légèrement supérieure à 2.0 (défaut) pour absorber
+    les micro-décalages pdfplumber sur les relevés Shine, tout en restant en-deçà de
+    4.0 (LCL) afin de ne pas fusionner des transactions distinctes.
     """
     year = str(datetime.now().year)
     pages_words: list[list[dict]] = []
@@ -3038,11 +3324,39 @@ def parse_transactions_by_column(pdf_file) -> pd.DataFrame:
             if words:
                 pages_words.append(words)
             page_text = page.extract_text() or ""
-            ym = re.search(r"(20\d{2})", page_text)
-            if ym:
-                year = ym.group(1)
+            year = _extract_year_from_text(page_text, fallback_year=year)
 
-    return parse_transactions_from_word_pages(pages_words, year=year, y_tol=2.0)
+    # Supprimer les lignes non-transactionnelles spécifiques à Shine
+    filtered_pages = _prefilter_shine_words(pages_words)
+
+    return parse_transactions_from_word_pages(filtered_pages, year=year, y_tol=y_tol)
+
+
+def parse_transactions_by_column(pdf_file, y_tol: float = 2.0) -> pd.DataFrame:
+    """
+    Parser colonne via pdfplumber — extrait les mots avec positions et appelle
+    parse_transactions_from_word_pages.
+
+    y_tol : tolérance verticale (points) pour regrouper les mots d'une même ligne.
+      • 2.0 (défaut) : précis, pour la plupart des banques.
+      • 4.0 (LCL)    : nécessaire car pdfplumber peut placer les montants de la colonne
+                       Débit/Crédit sur une y légèrement différente de la date (ex : 100 vs 101),
+                       ce qui les sépare en deux groupes distincts avec y_tol=2.0 et provoque
+                       des transactions manquées quand une ligne de référence SEPA (LIBELLE:…)
+                       déclenche un flush() avant que le montant soit traité.
+    """
+    year = str(datetime.now().year)
+    pages_words: list[list[dict]] = []
+
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(keep_blank_chars=False, x_tolerance=3)
+            if words:
+                pages_words.append(words)
+            page_text = page.extract_text() or ""
+            year = _extract_year_from_text(page_text, fallback_year=year)
+
+    return parse_transactions_from_word_pages(pages_words, year=year, y_tol=y_tol)
 
 
 # =========================================================
@@ -3309,7 +3623,8 @@ _COLUMN_BANKS = {
 _TEXT_BANKS = {
     "BNP_PARIBAS": parse_bnp_paribas_text,
     "REVOLUT": parse_revolut_text,
-    "SHINE": parse_shine_text,
+    # "SHINE" retiré de _TEXT_BANKS — géré par sa propre branche dans extract_all
+    # (parser colonne en priorité + parse_shine_text en fallback)
     "BANQUE_POPULAIRE": parse_banque_populaire_text,
     "CAISSE_EPARGNE": parse_caisse_epargne_text,
     "QONTO": parse_transactions_text,
@@ -3321,7 +3636,37 @@ _TEXT_BANKS = {
 # POINT D'ENTRÉE PRINCIPAL — EXTRACTION INTELLIGENTE
 # =========================================================
 
-def extract_all(pdf_file) -> dict:
+def extract_all_from_image(image_file) -> dict:
+    """
+    Entrée : fichier image (PNG / JPG / JPEG / TIFF / BMP / WEBP).
+    Convertit l'image en PDF mono-page puis lance le pipeline OCR GCV standard.
+    Retourne le même dictionnaire que extract_all().
+    """
+    from PIL import Image as PILImage
+
+    image_file.seek(0)
+    raw_bytes = image_file.read()
+
+    # Convertir l'image en PDF en mémoire via Pillow
+    img = PILImage.open(io.BytesIO(raw_bytes))
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+
+    pdf_buf = io.BytesIO()
+    img.save(pdf_buf, format="PDF", resolution=150)
+    pdf_buf.seek(0)
+    pdf_bytes = pdf_buf.read()
+
+    # Créer un objet compatible seek/read
+    class _BytesIO(io.BytesIO):
+        pass
+
+    fake_pdf = _BytesIO(pdf_bytes)
+    fake_pdf.name = getattr(image_file, "name", "image.pdf").rsplit(".", 1)[0] + ".pdf"
+    return extract_all(fake_pdf, force_ocr=True)
+
+
+def extract_all(pdf_file, force_ocr: bool = False) -> dict:
     """
     Orchestre l'extraction complète :
       1. Lecture bytes + détection texte natif vs image
@@ -3336,7 +3681,7 @@ def extract_all(pdf_file) -> dict:
     pdf_file.seek(0)
     pdf_bytes = pdf_file.read()
 
-    has_text = _pdf_has_text(pdf_bytes)
+    has_text = _pdf_has_text(pdf_bytes) and not force_ocr
 
     # ── Extraction du texte brut ──
     ocr_used = False
@@ -3375,8 +3720,7 @@ def extract_all(pdf_file) -> dict:
     closing = extract_closing_balance(raw_text)
 
     # Année de référence pour les formats DD/MM sans année
-    year_match = re.search(r"(20\d{2})", raw_text)
-    year_ref = year_match.group(1) if year_match else str(datetime.now().year)
+    year_ref = _extract_year_from_text(raw_text)
 
     df = pd.DataFrame(columns=["date", "libelle", "montant"])
 
@@ -3410,7 +3754,13 @@ def extract_all(pdf_file) -> dict:
         #   3. Parser LCL texte natif (si OCR très fidèle à la mise en page)
         #   4. Parser universel (dernier recours)
         if has_text:
-            df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
+            # LCL PDF natif : y_tol=4.0 indispensable.
+            # pdfplumber peut placer le montant Débit/Crédit sur une y légèrement
+            # différente de la date (ex : 100 vs 101). Avec y_tol=2.0, round(101/2)*2=102 ≠ 100
+            # → le montant se retrouve dans un groupe différent de la date → la transaction
+            # est flush() sans montant (perdue) quand une ligne LIBELLE:… survient.
+            # Avec y_tol=4.0 : round(101/4)*4=100 → même groupe → montant correctement rattaché.
+            df = parse_transactions_by_column(io.BytesIO(pdf_bytes), y_tol=4.0)
             if df.empty:
                 df = parse_lcl_text(raw_text, year_ref)
         elif ocr_used and pages_words:
@@ -3455,6 +3805,40 @@ def extract_all(pdf_file) -> dict:
             if df.empty:
                 df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
         # Fallback universel
+        if df.empty:
+            df = parse_transactions_text(raw_text, year=year_ref)
+
+    elif bank == "SHINE":
+        # ── Shine — Parser colonne en priorité (PDF texte natif) ──
+        #
+        # Shine structure ses relevés avec DEUX colonnes séparées Débit / Crédit
+        # (sans signe sur les montants). Le parser texte (parse_shine_text) ne peut
+        # pas distinguer les deux colonnes — il utilisait l'heuristique "De :" pour
+        # détecter les virements entrants, manquant tous les remboursements carte
+        # (ex : WORLD EDUCATION SERV, CERBA…) dont les montants tombent en colonne
+        # Crédit (x0 ≈ 535-545) mais n'ont pas de "De :" dans le libellé.
+        #
+        # parse_transactions_by_column_shine :
+        #   - Pré-filtre les mots pdfplumber (_prefilter_shine_words) :
+        #       supprime en-têtes répétés, pieds légaux, ligne "Solde au",
+        #       mots de type isolés ("Virement" / "instantané" sur ligne seule)
+        #   - Puis appelle le parser colonne avec y_tol=3.0
+        #
+        # Positions x relevé Shine :
+        #   - Débit  header x0=457 x1=477  → montants x0 ≈ 480-490
+        #   - Crédit header x0=515         → montants x0 ≈ 535-545
+        #   - boundary = (477 + 515) / 2 ≈ 496 → séparation nette
+        if has_text:
+            df = parse_transactions_by_column_shine(io.BytesIO(pdf_bytes))
+            if df.empty:
+                df = parse_shine_text(raw_text)
+        elif ocr_used and pages_words:
+            # OCR : pas de filtre de mots GCV (les en-têtes sont généralement
+            # absents des blocs OCR structurés) ; on préfiltre quand même par sécurité
+            filtered_gcv = _prefilter_shine_words(pages_words)
+            df = parse_transactions_from_word_pages(filtered_gcv, year=year_ref, y_tol=3.0)
+            if df.empty:
+                df = parse_shine_text(raw_text)
         if df.empty:
             df = parse_transactions_text(raw_text, year=year_ref)
 
@@ -3708,17 +4092,44 @@ def main():
         </p>
         """, unsafe_allow_html=True)
 
-    uploaded = st.file_uploader("📁 Déposer le relevé bancaire (PDF)", type=["pdf"])
+    # ── Upload : PDF, images scannées, photos de relevés ──
+    _IMAGE_TYPES = ["png", "jpg", "jpeg", "tiff", "tif", "bmp", "webp"]
+    uploaded = st.file_uploader(
+        "📁 Déposer le relevé bancaire (PDF ou image scannée)",
+        type=["pdf"] + _IMAGE_TYPES,
+        help="Formats acceptés : PDF natif, PDF scanné, PNG, JPG, JPEG, TIFF, BMP, WEBP",
+    )
+
+    col_force, _ = st.columns([2, 5])
+    with col_force:
+        force_ocr = st.checkbox(
+            "🔎 Forcer OCR (Google Vision)",
+            value=False,
+            help=(
+                "Cochez si le PDF est imprimé/scanné mais détecté à tort comme 'texte natif'. "
+                "L'OCR sera appliqué même si le PDF contient du texte extractible."
+            ),
+        )
+
     if not uploaded:
-        st.info("Importez un relevé bancaire PDF pour commencer.")
+        st.info("Importez un relevé bancaire (PDF ou image) pour commencer.")
         return
 
     safe_name = sanitize_filename(uploaded.name)
     if safe_name != uploaded.name:
         st.caption(f"📄 Fichier reçu : `{uploaded.name}` → normalisé en `{safe_name}`")
 
+    file_ext = uploaded.name.rsplit(".", 1)[-1].lower()
+    is_image_file = file_ext in _IMAGE_TYPES
+
     with st.spinner("🔍 Analyse du relevé en cours…"):
-        result = extract_all(uploaded)
+        if is_image_file:
+            result = extract_all_from_image(uploaded)
+        else:
+            result = extract_all(uploaded, force_ocr=force_ocr)
+
+    if is_image_file:
+        st.info(f"🖼️ Image détectée ({file_ext.upper()}) — conversion puis OCR via **Google Cloud Vision**")
 
     bank     = result["bank"]
     iban     = result["iban"]
@@ -3729,8 +4140,10 @@ def main():
     ocr_used = result["ocr_used"]
     raw_text = result["raw_text"]
 
-    if ocr_used:
+    if ocr_used and not is_image_file:
         st.info("🔎 PDF image/scanné détecté — extraction via **Google Cloud Vision**")
+    elif not is_image_file and force_ocr:
+        st.info("🔎 Mode OCR forcé — extraction via **Google Cloud Vision**")
 
     # ══════════ SECTION 1 : INFORMATIONS COMPTE ══════════
     st.subheader("🏦 Informations du compte")
@@ -3804,7 +4217,8 @@ def main():
             opening_balance=opening_balance,
         )
 
-        ofx_filename = safe_name.replace(".pdf", ".ofx")
+        ofx_filename = re.sub(r"\.(png|jpg|jpeg|tiff?|bmp|webp)$", ".ofx", safe_name, flags=re.IGNORECASE)
+        ofx_filename = ofx_filename.replace(".pdf", ".ofx")
 
         st.download_button(
             label="⬇️ Télécharger le fichier OFX",
