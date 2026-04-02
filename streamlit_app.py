@@ -2036,13 +2036,11 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
     )
 
     # Indicateurs de CRÉDIT (montant positif)
-    # Couvre : remises CB, virements reçus (EDENRED, MARKET PAY, SWILE, Deliveroo,
-    # Uber, Pluxee, UP COOP, TotalEnergies remboursement, ANCV/DRFIP…)
+    # Couvre : remises CB, virements reçus, versements espèces, remises chèques…
     # NOTE: \s* partout car pdfplumber fusionne les mots sans espace.
     _CREDIT_RE = re.compile(
-        r"REMISE\s*CB"                        # REMISE CB ou REMISECB (pdfplumber fusionne)
-        r"|VIR\s*INST\s*RE"                  # ← FIX PRINCIPAL : VIR INST RE XXXXXXXXX
-                                              #   = virement instantané REÇU (crédit entrant)
+        r"REMISE\s*CB"                        # REMISE CB / REMISECB — encaissement TPE
+        r"|VIR\s*INST\s*RE"                  # VIR INST RE XXXXXX = virement instantané REÇU
                                               #   pdfplumber fusionne → "VIRINSTRE653592629181"
                                               #   ≠ "VIR INSTANTANE EMIS" / "VIR INST EMIS" (débit)
         r"|VIR\s*RECU"                        # VIR RECU ou VIRRECU
@@ -2050,6 +2048,16 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
         r"|REMBOURSEMENT\s*PRLV"
         r"|CARTE.{0,25}REMBT"
         r"|CART.{0,10}REMB"
+        # ── Versements espèces / chèques ──────────────────────────────────────
+        r"|VRST\s*GAB"                        # Versement espèces via GAB (distributeur)
+                                              # Ex : "VRST GAB 13/01/26 16H44 003800"
+        r"|VERST\s*ESP"                       # Versement espèces manuel ou via GAB
+                                              # Ex : "VERST ESP 08/01/26 100,00"
+                                              #      "VERST ESP GAB 26/01/26 19H51 713876"
+        r"|REMISE\s*CH[EÈ]QUE"               # Remise de chèque(s) au guichet
+                                              # Ex : "REMISE CHEQUE 0000225 015"
+                                              # pdfplumber peut fusionner → "REMISECHEQUE..."
+        # ── Virements entrants identifiés par l'émetteur (DE:) ────────────────
         r"|DE:\s*SWILE"
         r"|DE:\s*MARKET\s*PAY"               # MARKET PAY ou MARKETPAY
         r"|DE:\s*DELIVEROO"
@@ -2069,17 +2077,21 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
     # NOTE: \s* car pdfplumber peut fusionner les mots SG
     _DEBIT_RE = re.compile(
         r"CARTE\s*X\d{4}(?!\s*REMBT)"          # CARTE X3580 ou CARTEX3580 (pas remboursement)
-        r"|PRELEVEMENT\s*EUROP[EÉ]EN"            # PRELEVEMENT EUROPEEN ou PRELEVEMENTEUROPEEN
+        r"|PRELEVEMENT\s*EUROP[EÉ]EN"           # PRELEVEMENT EUROPEEN ou PRELEVEMENTEUROPEEN
+                                                 # ⚠ "PRLV EUROP[EÉ]EN" volontairement absent :
+                                                 #   il est sous-ensemble de "REMBOURSEMENT PRLV EUROPEEN"
+                                                 #   (crédit). "PRLV EUROPEEN B2B" tombe déjà en -1 par défaut.
         r"|PRELEVEMENT\s*SEPA"
         r"|VIR\s*INSTANTANE\s*EMIS"             # VIR INSTANTANE EMIS ou VIRINSTANTANEEMIS
         r"|VIR\s*EUROP[EÉ]EN\s*EMIS"
         r"|VIR\s*PERM\b"
         r"|CHEQUE\b"
         r"|CIONS\s*TENUE"                        # CIONS TENUE ou CIONSTENUE
-        r"|COTIS(?:ATION)?"                     # COTISATION, COTIS… (sans \b : pdfplumber fusionne
-                                                # ex: "COTISATIONMENSUELLEJAZZPRO" sans espace)
-        r"|ABONNEMENT\s*MATERIEL"               # loyer TPE / matériel (ex: ABONNEMENTMATERIEL)
-        r"|INT\s*D[EÉ]BITEURS",
+        r"|COTIS(?:ATION)?"                      # COTISATION, COTIS… (sans \b : pdfplumber fusionne
+                                                 # ex: "COTISATIONMENSUELLEJAZZPRO" sans espace)
+        r"|ABONNEMENT\s*MATERIEL"                # loyer TPE / matériel (ex: ABONNEMENTMATERIEL)
+        r"|INT\s*D[EÉ]BITEURS"
+        r"|QUIETIS\s*PRO",                       # cotisation abonnement Pro SG (ex: QUIETIS PRO REDUC)
         re.IGNORECASE,
     )
 
@@ -2102,18 +2114,25 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
     def _determine_sign(full_text: str) -> int:
         """Retourne +1 (crédit) ou -1 (débit) selon les mots-clés du bloc.
 
-        Cas spécial INT DEBITEURS ET CION DECOUVERT :
-          Ce libellé peut être un DÉBIT (frais d'intérêts sur découvert) ou un CRÉDIT
-          (remboursement d'intérêts, ex. : solde positif toute l'année).
-          Heuristique : si les lignes de détail contiennent des montants négatifs
-          ("-0,44", "-0,42" …), c'est un avoir → CRÉDIT.
-          Sinon (montants positifs, ex. "0,27") → DÉBIT réel.
+        Règles de priorité explicite (avant la détection générique) :
+
+        1. REMISE CH[EÈ]QUE : toujours CRÉDIT (remise/dépôt de chèque client).
+           CHEQUE\\b dans _DEBIT_RE génère une fausse ambiguïté -> on court-circuite.
+           Ex : "REMISE CHEQUE 0000225 015" ou "REMISECHEQUE..." (pdfplumber fusionne).
+
+        2. INT DEBITEURS : CRÉDIT ou DÉBIT selon les sous-montants.
+           Si les lignes de détail contiennent des montants négatifs ("-0,44" ...)
+           c'est un avoir -> CRÉDIT. Sinon (montants positifs, ex "0,27") -> DÉBIT.
         """
-        # ── Cas INT DEBITEURS : détecter crédit vs débit via les détails ──
+        # ── Règle 1 : REMISE CHEQUE -> toujours crédit ──────────────────────────
+        if re.search(r"REMISE\s*CH[EÈ]QUE", full_text, re.IGNORECASE):
+            return 1
+
+        # ── Règle 2 : INT DEBITEURS -> détecter crédit vs débit via les détails ──
         if re.search(r"INT\s*D[EÉ]BITEURS", full_text, re.IGNORECASE):
             if re.search(r"-\s*\d+[,\.]\d{2}", full_text):
-                return 1   # montants négatifs dans les détails → remboursement → crédit
-            return -1      # montants positifs → frais réels → débit
+                return 1   # montants négatifs dans les détails -> remboursement -> crédit
+            return -1      # montants positifs -> frais réels -> débit
 
         is_credit = bool(_CREDIT_RE.search(full_text))
         is_debit  = bool(_DEBIT_RE.search(full_text))
@@ -2121,7 +2140,7 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
             return 1
         if is_debit and not is_credit:
             return -1
-        # Ambiguïté ou non reconnu → débit par défaut (plus sûr comptablement)
+        # Ambiguïté ou non reconnu -> débit par défaut (plus sûr comptablement)
         return -1
 
     def _extract_amount(blines: list[str]) -> float | None:
