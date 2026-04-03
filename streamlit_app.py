@@ -1542,22 +1542,28 @@ def parse_bnp_paribas_text(text: str, year: str | None = None) -> pd.DataFrame:
 
     # ── En-têtes de section : avec ou sans espaces (pdfplumber supprime les espaces) ──
     # CRÉDIT : REMISES D'ESPÈCES · REMISES DE CHÈQUES · REMISES DE CARTES · VIREMENTS REÇUS
+    #          AUTRES OPÉRATIONS CRÉDIT
     _CREDIT_HDR = re.compile(
         r"^REMISES?\s*D.?\s*ESPECES?$|^REMISES?\s*D.?\s*ESPECES?\s+|"
         r"^REMISESDESPECES|^REMISESDECARTES|^REMISESDE\s*CARTES?|"
         r"^REMISES?\s*DE\s*CARTES?$|^VIREMENTSRECUS?$|^VIREMENTS?\s*RE[CÇ]US?$|"
-        # FIX: REMISES DE CHÈQUES (compact pdfplumber ou avec espaces)
-        r"^REMISESDECHEQUES$|^REMISES?\s*DE\s*CH[EÈ]QUES?$",
+        # REMISES DE CHÈQUES (compact pdfplumber ou avec espaces)
+        r"^REMISESDECHEQUES$|^REMISES?\s*DE\s*CH[EÈ]QUES?$|"
+        # AUTRES OPÉRATIONS CRÉDIT (ex: remboursement CB)
+        r"^AUTRESOPERATIONSCREDIT$|^AUTRES\s*OP[EÉ]RATIONS?\s*CR[EÉ]DIT$",
         re.IGNORECASE,
     )
-    # DÉBIT : PAIEMENTS PAR CARTES · CHÈQUES ÉMIS · VIREMENTS ÉMIS · PRÉLÈVEMENTS · AUTRES OPÉRATIONS DÉBIT
+    # DÉBIT : PAIEMENTS PAR CARTES · CHÈQUES ÉMIS · VIREMENTS ÉMIS · PRÉLÈVEMENTS
+    #         RETRAITS D'ESPÈCES · AUTRES OPÉRATIONS DÉBIT
     _DEBIT_HDR = re.compile(
         r"^PAIEMENTSPARCARTES?|^PAIEMENTS?\s*PAR\s*CARTES?|"
-        # FIX: CHÈQUES ÉMIS (compact pdfplumber ou avec espaces)
+        # CHÈQUES ÉMIS (compact pdfplumber ou avec espaces)
         r"^CHEQUESEMIS$|^CH[EÈ]QUES?\s*[EÉ]MIS$|"
         r"^VIREMENTSEMIS$|^VIREMENTS?\s*[EÉ]MIS$|"
         r"^PRELEVEMENTS?[,\s]|^PR[EÉ]L[EÈ]VEMENTS?[,\s]|"
-        r"^AUTRESOPERATIONSDEBIT|^AUTRES\s*OP[EÉ]RATIONS?\s*DEBIT",
+        r"^AUTRESOPERATIONSDEBIT|^AUTRES\s*OP[EÉ]RATIONS?\s*DEBIT|"
+        # RETRAITS D'ESPÈCES / RETRAITS D'ESPECES (retraits espèces ATM)
+        r"^RETRAITS?\s*D[\s'''\u2019]?\s*ESPECES?|^RETRAIT\s*SDESPECES",
         re.IGNORECASE,
     )
 
@@ -1581,6 +1587,11 @@ def parse_bnp_paribas_text(text: str, year: str | None = None) -> pd.DataFrame:
         # Pieds de page BNP pdfplumber compactés
         r"|^BNPPARIBAS|BNPPARIBASSAau|servicegratuit"
         r"|^APPLICATIONANTIGASPI$|^NOTPROVIDED$"
+        # Lignes de solde et totaux d'en-tête (ex: "Solde au 20 JANVIER :")
+        r"|^Solde\s+au\s+\d|^Solde\s+au\s+\w"
+        r"|^D[eé]bit\s*:[\s\d]|^Cr[eé]dit\s*:[\s\d]"
+        # Nom de l'agence BNP seul sur une ligne (ex: "THIAIS")
+        r"|^Service\s+Client$"
         r")",
         re.IGNORECASE,
     )
@@ -2687,23 +2698,46 @@ def parse_lcl_ocr_text(text: str, year: str | None = None) -> pd.DataFrame:
 def parse_transactions_text(text: str, year: str | None = None) -> pd.DataFrame:
     """
     Parser texte universel compatible Qonto et résultat OCR générique.
+
+    Supporte les relevés Qonto multi-pages (le footer "Qonto SA, au capital de..."
+    apparaît en bas de CHAQUE page — il ne doit pas tronquer le texte).
+    Seul "Toutes les cartes..." (dernière page) marque la fin des transactions.
     """
     text = clean_text(text)
 
+    # ── Tronquer au PREMIER marqueur de fin de transactions (break après 1er match) ──
+    # "Qonto SA" retiré : apparaît dans le footer de chaque page → tronquerait trop tôt
     for stop_pat in [
-        r"[Tt]outes\s+les\s+cartes",
+        r"[Tt]outes\s+les\s+cartes\s+de\s+votre",
         r"[Tt]otal\s+des\s+op[ée]rations",
-        r"Qonto\s+SA",
         r"Qonto,\s+une\s+marque",
         r"OLINDA\s+SAS",
     ]:
         m = re.search(stop_pat, text)
         if m:
             text = text[: m.start()]
+            break  # s'arrêter au premier marqueur trouvé
 
     if year is None:
         ym = re.search(r"20\d{2}", text)
         year = ym.group(0) if ym else str(datetime.now().year)
+
+    # ── Lignes de footer/header inter-pages Qonto à ignorer ──
+    # (apparaissent entre chaque page dans l'extraction pdfplumber)
+    _QONTO_SKIP = re.compile(
+        r"^Qonto\s+(SA|est\s+agr[eé]|SAS)|"
+        r"^Scann[eé]\s+avec\s+CamScanner|"
+        # En-tête de période répété en bas de chaque page : "Du 01/03/2026 au 31/03/2026"
+        r"^Du\s+\d{2}/\d{2}/\d{4}\s+au\s+\d{2}/\d{2}/\d{4}|"
+        # Ligne de footer avec IBAN entre parenthèses : "(FR76 1695 8000 ...)"
+        r"^\S.*\(FR\d{2}\s+\d{4}|"
+        r"^\d+/\d+\s*$|"                    # numéro de page ex: "1/6", "2/6"
+        r"^IBAN\s*:\s*FR|^BIC\s*:\s*QNT|"
+        r"si[eè]ge\s+social|numéro\s+16958|au\s+capital\s+de\s+\d|"
+        r"^Relevés?\s+de\s+compte$|"
+        r"^Date\s+de\s+valeur\s*$|^Transactions\s*$|^D[eé]bit\s*$|^Cr[eé]dit\s*$",
+        re.IGNORECASE,
+    )
 
     lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
     transactions: list[dict] = []
@@ -2719,6 +2753,7 @@ def parse_transactions_text(text: str, year: str | None = None) -> pd.DataFrame:
             return None
         date_str = dm.group(1)
 
+        # Priorité 1 : montant signé explicite  (+/- AMOUNT EUR)
         m = re.search(
             r"([\+\-])\s*([\d\s\xa0]*[\d,\.]+\d{2})\s*EUR",
             full,
@@ -2735,6 +2770,7 @@ def parse_transactions_text(text: str, year: str | None = None) -> pd.DataFrame:
             libelle = re.sub(r"\s{2,}", " ", libelle)[:120]
             return {"date": f"{date_str}/{year}", "libelle": libelle, "montant": round(amount, 2)}
 
+        # Priorité 2 : dernier montant numérique sans signe EUR
         raw_amounts = re.findall(r"\d[\d\s\xa0]*[,\.]\d{2}", full)
         amounts = [v for a in raw_amounts if (v := clean_amount(a)) is not None]
         if not amounts:
@@ -2744,6 +2780,10 @@ def parse_transactions_text(text: str, year: str | None = None) -> pd.DataFrame:
         return {"date": f"{date_str}/{year}", "libelle": libelle, "montant": round(amount, 2)}
 
     for line in lines:
+        # Ignorer les lignes de footer/header inter-pages
+        if _QONTO_SKIP.search(line):
+            continue
+
         if re.match(r"^\d{2}/\d{2}\b", line):
             if block:
                 tx = process_block(block)
