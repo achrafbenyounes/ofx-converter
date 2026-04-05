@@ -4241,6 +4241,9 @@ def main():
         """
         <div class="footer-note">
             OFX Converter Pro — conversion fiable, multi-banques France, export Odoo en un clic.
+            <span style="margin-left:1.2rem; color:rgba(180,200,240,0.45); font-size:0.8rem; font-weight:500;">
+                Conçu par <strong style="color:rgba(180,200,240,0.65);">Achraf BEN YOUNES</strong>
+            </span>
         </div>
         """,
         unsafe_allow_html=True,
