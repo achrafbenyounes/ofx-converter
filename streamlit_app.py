@@ -1,18 +1,15 @@
 """
 OFX Converter Pro — Multi-banques France → Odoo
 ================================================
-Compatible (relevés texte ET scannés / Print-to-PDF) :
+Compatible (relevés PDF texte natif) :
   La Banque Postale · BNP Paribas · Crédit Agricole · Société Générale
   CIC · Crédit Mutuel · LCL · Caisse d'Épargne · Banque Populaire
   Qonto · Revolut Business · Shine · Boursorama · Hello Bank · N26 · Fortuneo
   **Finom** (finom.co / PNL Fintech B.V.)…
 
-OCR : Google Cloud Vision API
-  → Configurer GCV_API_KEY dans .streamlit/secrets.toml
-
 Stratégies d'extraction :
-  1. Parser colonne    (PDF texte natif) — coordonnées x/y via pdfplumber ou GCV
-  2. Parser banque     (OCR text)        — regex spécifiques à chaque format
+  1. Parser colonne    (PDF texte natif) — coordonnées x/y via pdfplumber
+  2. Parser banque     (texte brut)      — regex spécifiques à chaque format
   3. Parser universel  (Qonto + fallback) — regex sur blocs DD/MM … montant EUR
 
 Format OFX généré :
@@ -20,22 +17,23 @@ Format OFX généré :
   Montants : X.XX (point décimal, JAMAIS virgule, 2 décimales)
 """
 
-import base64
 import hashlib
 import io
 import os
 import re
-import subprocess
-import tempfile
 import unicodedata
 from datetime import datetime
 
 import pandas as pd
 import pdfplumber
-import requests
 import streamlit as st
 
-st.set_page_config(page_title="OFX Converter Pro", layout="wide")
+st.set_page_config(
+    page_title="OFX Converter Pro",
+    page_icon="💳",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
 
 # =========================================================
@@ -125,7 +123,7 @@ def _normalize_date_str(date_str: str, year: str) -> str:
 
 def _extract_year_from_text(text: str, fallback_year: str | None = None) -> str:
     """
-    Extrait l'année du relevé depuis le texte OCR/pdfplumber, en évitant les
+    Extrait l'année du relevé depuis le texte extrait par pdfplumber, en évitant les
     faux positifs provenant des numéros IBAN (ex : "FR47 3000 2062 5200…"
     contient "2062" qui matcherait un simple re.search(r"20\d{2}")).
 
@@ -409,7 +407,7 @@ def extract_closing_balance(text: str) -> float | None:
 
 
 # =========================================================
-# PARSERS SPÉCIFIQUES PAR BANQUE (texte OCR / texte natif)
+# PARSERS SPÉCIFIQUES PAR BANQUE
 # =========================================================
 
 def parse_revolut_text(text: str) -> pd.DataFrame:
@@ -2452,252 +2450,9 @@ def parse_lcl_text(text: str, year: str | None = None) -> pd.DataFrame:
     return df
 
 
-def parse_lcl_ocr_text(text: str, year: str | None = None) -> pd.DataFrame:
-    """
-    LCL (Crédit Lyonnais) — parser dédié pour PDF scannés / images OCR.
-
-    Variante robuste de parse_lcl_text() adaptée au texte produit par Google
-    Cloud Vision sur des relevés LCL scannés ou imprimés en PDF-image.
-
-    Différences avec le parser texte natif :
-      • Accepte DD.MM et DD/MM comme date opération (OCR peut produire les deux)
-      • Accepte DD.MM.YY, DD.MM.YYYY, DD/MM/YY, DD/MM/YYYY comme date valeur
-      • Le "." colonne (indicateur DÉBIT/CRÉDIT) est optionnel :
-          - Si présent  → logique identique à parse_lcl_text (prioritaire)
-          - Si absent   → détermination par mots-clés LCL, puis heuristique
-      • Ignore les artefacts OCR courants (espaces parasites dans les montants)
-      • Enrichi des préfixes CB23XXXX courants sur LCL (CB23PAYPAL, CB23AMAZON…)
-      • Gère les libellés multi-lignes provenant de l'OCR (mots coupés entre pages)
-
-    Ordre de priorité pour le signe :
-      1. ". MONTANT"  → CRÉDIT  (indicateur colonne préservé par l'OCR)
-      2. "MONTANT ."  → DÉBIT   (indicateur colonne préservé par l'OCR)
-      3. Mots-clés CRÉDIT dans le libellé assemblé
-      4. Mots-clés DÉBIT  dans le libellé assemblé
-      5. Deux montants dans le trailing → avant-dernier = montant réel (dernier = solde)
-      6. Défaut → DÉBIT (conservatisme comptable)
-    """
-    if year is None:
-        year = _extract_year_from_text(text)
-
-    # ── Tronquer aux totaux / solde final ──
-    stop_pos = len(text)
-    for stop_pat in [r"TOTAUX\s+\d", r"SOLDE\s+EN\s+EUROS"]:
-        for m in re.finditer(stop_pat, text, re.IGNORECASE):
-            stop_pos = min(stop_pos, m.start())
-    text = text[:stop_pos]
-
-    # ── Lignes à ignorer (identique parse_lcl_text + variantes OCR) ──
-    # NOTE : "\bLIBELLE\b" supprimé — les lignes "LIBELLE:..." sont des continuations
-    # SEPA valides. Seul "DATE LIBELLE" (en-tête de colonne) est skippé.
-    _SKIP = re.compile(
-        r"ECRITURES\s+DE\s+LA\s+PERIODE|DATE\s+LIBELLE|DEBIT\s+CREDIT"
-        r"|ANCIEN\s+SOLDE|SOLDE\s+EN\s+EUROS|SOLDE\s+INTERMEDIAIRE"
-        r"|Page\s+\d|Cr[eé]dit\s+Lyonnais|RELEVE\s+DE"
-        r"|D\.STOCK|Indicatif\s*:|VILLEPARISIS|RELEVE\s+D.IDENTITE"
-        r"|BIC\s*:|IBAN\s*:|votre\s+conseiller|Prenez\s+rendez"
-        r"|du\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s+au|RELEVE\s+DE\s+COMPTE"
-        r"|Banque\s+Indicatif|N°\s+de\s+compte|SIREN\s+\d"
-        r"|MACRO\s+MULTI\s+SERVICES|Indicatif\s*:\s*\d"
-        r"|\bVALEUR\b|\bDATE\b|\bDEBIT\b|\bCREDIT\b",
-        re.IGNORECASE,
-    )
-
-    # ── Indicateurs CRÉDIT (entrée d'argent) — enrichis pour OCR ──
-    #
-    # RÈGLE : un VIR SEPA / VIR INST est CRÉDIT sauf s'il figure dans la liste
-    # d'exceptions DÉBIT ci-dessous.  La liste est intentionnellement courte pour
-    # éviter les faux-négatifs : seuls les libellés CLAIREMENT sortants (loyers,
-    # cotisations sociales, fournisseurs récurrents identifiés) sont exclus.
-    # Les cas ambigus (même bénéficiaire pouvant être créditeur ou débiteur selon
-    # le mois) sont laissés à l'indicateur "." colonne, prioritaire sur les mots-clés.
-    _CREDIT_RE = re.compile(
-        r"REMISE\s+CB\b"                                      # remise TPE / caisse
-        r"|VERSEMENT\s+ALS\b"                                 # versement espèces
-        r"|VIR\s+(?:SEPA|INST)\s+EDENRED\b"                  # ticket restaurant
-        r"|VIR\s+(?:SEPA|INST)\s+PLUXEE\b"
-        r"|VIR\s+(?:SEPA|INST)\s+UP\s+COOP\b"
-        r"|VIR\s+(?:SEPA|INST)\s+AitKaci\b"
-        r"|VOTRE\s+REMISE\s+SUR\s+PRODUITS"
-        r"|LCL\s+A\s+LA\s+CARTE\s+PRO\s+VOTRE\s+REMISE"
-        # ── Virements reçus identifiés par le libellé OCR ──
-        r"|O[\/\\]DE\s+PAIEMENT"                              # ordre de paiement reçu (CRÉDIT)
-        r"|VIR\s+EI\b"                                        # virement entrant individuel (CRÉDIT)
-        r"|VIR\s+INST\s+EI\b"                                 # virement entrant (CRÉDIT)
-        # NB : CIONS/O/PAIEMT est une commission de paiement → DÉBIT (retiré de cette liste)
-        # ── VIR SEPA entrants : tout sauf les sorties connues ──
-        # Exclusions DÉBIT confirmées : loyers SCI, cotisations sociales, fournisseurs récurrents
-        r"|VIR\s+SEPA\s+(?!SCI\b|ABADA\b|GCOLLECT\b|PREFILOC|MALAKOFF|URSSAF|SIE\s+VAL|ERCINEA|GAN\s+ASS)(?!O\s+MEGA\b)(?!SAS\s+YNOV\b)"
-        # ── VIR INST entrants : tout sauf les sorties connues ──
-        # NB : THOMAS retiré de la liste d'exclusion — VIR INST d'un particulier = crédit reçu
-        r"|VIR\s+INST\s+(?!DM\s+INFORMATIQUE|CSI\b|ERCINEA|O\s+MEGA|SAS\s+YNOV|GCOLLECT|RETURN\s+TRADING)",
-        re.IGNORECASE,
-    )
-
-    # ── Indicateurs DÉBIT (sortie d'argent) — enrichis pour OCR ──
-    _DEBIT_RE = re.compile(
-        r"CHQ\.\s*\d"
-        r"|PRLV\s+SEPA\b"                                     # prélèvement automatique
-        r"|COMMISSIONS\s+SUR\s+REMISE"                        # commission bancaire
-        r"|COTISATION\s+(?:MENSUELLE|DE\s+VOTRE)\s+(?:CARTE|OPTION)"
-        r"|COTISATION\s+MENSUELLE\s+CARTE"
-        r"|COTISATION\s+DE\s+VOTRE\s+OPTION\s+PRO"
-        r"|PRLV\s+SEPA\s+B2B\b"
-        r"|ABON\s+LCL"                                        # abonnement LCL
-        r"|CIONS[\/\\]O[\/\\]PAIEMT"                          # commission sur paiement (DÉBIT)
-        # ── CB23XXXX : paiements carte courants sur relevés LCL ──
-        r"|CB23(?:PAYPAL|AMAZON|EBAY|ESSO|APRR|DAC\s+ENI|RELAIS|MAXICOFFEE|AREAS|KFC|COFIROUTE|INPI|SALVA|HOSTINGER|GOOGLE)\b"
-        r"|\bCB23\w+"                                         # fallback tous CB23
-        # ── Virements sortants identifiés ──
-        r"|VIR\s+SEPA\s+(?:SCI\b|ABADA\b|GCOLLECT\b|PREFILOC|MALAKOFF|URSSAF|SIE\s+VAL|ERCINEA|GAN\s+ASS)"
-        r"|VIR\s+SEPA\s+(?:SAS\s+YNOV|O\s+MEGA)"
-        # NB : THOMAS retiré — un virement reçu d'un particulier est un crédit
-        r"|VIR\s+INST\s+(?:DM\s+INFORMATIQUE|CSI\b|ERCINEA|O\s+MEGA|SAS\s+YNOV|GCOLLECT|RETURN\s+TRADING)",
-        re.IGNORECASE,
-    )
-
-    # ── Regex dates ──
-    # Date opération en début de ligne : DD.MM ou DD/MM (OCR)
-    _DATE_START = re.compile(r"^(\d{2})[\.\/](\d{2})\s+(.+)", re.DOTALL)
-    # Date valeur : DD.MM.YY / DD.MM.YYYY / DD/MM/YY / DD/MM/YYYY
-    _VALEUR_RE  = re.compile(r"\b(\d{2})[\.\/](\d{2})[\.\/](\d{2,4})\b\s*(.*)", re.DOTALL)
-    _AMT_RE     = re.compile(r"(\d[\d\s]*[,\.]\d{2})")
-
-    lines = text.split("\n")
-    transactions: list[dict] = []
-    block: list[str] = []
-
-    def flush_block(blines: list[str]) -> dict | None:
-        if not blines:
-            return None
-        first = blines[0].strip()
-        dm = _DATE_START.match(first)
-        if not dm:
-            return None
-
-        dd, mm, rest = dm.group(1), dm.group(2), dm.group(3)
-
-        # ── Date valeur ──
-        # On cherche d'abord une date avec points (DD.MM.YY) — format natif LCL.
-        # Fallback : slash (DD/MM/YY) — artefact OCR ou date dans un libellé.
-        _VALEUR_DOT = re.compile(r"\b(\d{2})\.(\d{2})\.(\d{2,4})\b\s*(.*)", re.DOTALL)
-        vm = _VALEUR_DOT.search(rest) or _VALEUR_RE.search(rest)
-        if vm:
-            val_yy   = vm.group(3)
-            full_yr  = ("20" + val_yy) if len(val_yy) == 2 else val_yy
-            # Validation : l'année doit être dans une plage réaliste (2000-2099)
-            # et cohérente avec l'année du relevé (±1 an max).
-            # Évite les fragments IBAN comme "2062" extraits à tort.
-            try:
-                yr_int  = int(full_yr)
-                ref_int = int(year)
-                if not (2000 <= yr_int <= 2099 and abs(yr_int - ref_int) <= 1):
-                    full_yr = year
-            except (ValueError, TypeError):
-                full_yr = year
-            date_str    = f"{dd}/{mm}/{full_yr}"
-            libelle_raw = rest[: vm.start()].strip()
-            trailing    = vm.group(4).strip()
-            # Supprimer toute date résiduelle du trailing (2ème occurrence, artefact OCR)
-            # Ex : "04.11.25 9,89 ." → "9,89 ." après suppression de "04.11.25"
-            trailing = re.sub(r"\b\d{2}[\.\/]\d{2}[\.\/]\d{2,4}\b\s*", "", trailing).strip()
-        else:
-            date_str    = f"{dd}/{mm}/{year}"
-            libelle_raw = rest.strip()
-            trailing    = ""
-
-        # ── Assembler libellé (ligne 1 + continuations) ──
-        extra_parts: list[str] = []
-        for ln in blines[1:]:
-            s = ln.strip()
-            if not s or _SKIP.search(s) or _DATE_START.match(s):
-                continue
-            extra_parts.append(s)
-
-        full_lib = " ".join(p for p in [libelle_raw] + extra_parts if p)
-        full_lib = re.sub(r"\s{2,}", " ", full_lib).strip()[:120]
-
-        # ── Détection du signe via le trailing ──
-        credit_by_dot = re.match(r"^\.\s+(.+)$", trailing)
-        debit_by_dot  = re.search(r"(\d[\d\s]*[,\.]\d{2})\s+\.\s*$", trailing)
-
-        if credit_by_dot:
-            raw_amt = _AMT_RE.search(credit_by_dot.group(1))
-        elif debit_by_dot:
-            raw_amt = _AMT_RE.search(debit_by_dot.group(1))
-        elif trailing:
-            raw_amt = _AMT_RE.search(trailing)
-        else:
-            raw_amt = _AMT_RE.search(libelle_raw)
-            if raw_amt:
-                full_lib = full_lib[: full_lib.rfind(raw_amt.group(0))].strip()
-
-        if not raw_amt:
-            return None
-
-        amount = clean_amount(raw_amt.group(0))
-        if amount is None or amount == 0:
-            return None
-
-        # ── Signe : indicateur "." > mots-clés > heuristique > défaut DÉBIT ──
-        if credit_by_dot:
-            montant = abs(amount)
-        elif debit_by_dot:
-            montant = -abs(amount)
-        else:
-            is_credit = bool(_CREDIT_RE.search(full_lib))
-            is_debit  = bool(_DEBIT_RE.search(full_lib))
-            if is_credit and not is_debit:
-                montant = abs(amount)
-            elif is_debit:
-                montant = -abs(amount)
-            else:
-                # Heuristique OCR : si trailing contient 2 montants,
-                # le dernier est probablement le solde → prendre l'avant-dernier
-                all_amts = [clean_amount(a) for a in _AMT_RE.findall(trailing)]
-                all_amts = [v for v in all_amts if v is not None and v > 0]
-                if len(all_amts) >= 2:
-                    amount = all_amts[-2]
-                montant = -abs(amount)  # débit par défaut
-
-        return {"date": date_str, "libelle": full_lib, "montant": round(montant, 2)}
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if _SKIP.search(stripped):
-            if block:
-                tx = flush_block(block)
-                if tx:
-                    transactions.append(tx)
-                block = []
-            continue
-
-        if _DATE_START.match(stripped):
-            if block:
-                tx = flush_block(block)
-                if tx:
-                    transactions.append(tx)
-            block = [stripped]
-        elif block:
-            block.append(stripped)
-
-    if block:
-        tx = flush_block(block)
-        if tx:
-            transactions.append(tx)
-
-    if not transactions:
-        return pd.DataFrame(columns=["date", "libelle", "montant"])
-    df = pd.DataFrame(transactions)
-    df["montant"] = df["montant"].round(2)
-    return df
-
-
 def parse_transactions_text(text: str, year: str | None = None) -> pd.DataFrame:
     """
-    Parser texte universel compatible Qonto et résultat OCR générique.
+    Parser texte universel compatible Qonto et fallback générique.
 
     Supporte les relevés Qonto multi-pages (le footer "Qonto SA, au capital de..."
     apparaît en bas de CHAQUE page — il ne doit pas tronquer le texte).
@@ -2719,23 +2474,29 @@ def parse_transactions_text(text: str, year: str | None = None) -> pd.DataFrame:
             break  # s'arrêter au premier marqueur trouvé
 
     if year is None:
-        ym = re.search(r"20\d{2}", text)
-        year = ym.group(0) if ym else str(datetime.now().year)
+        year = _extract_year_from_text(text)
 
     # ── Lignes de footer/header inter-pages Qonto à ignorer ──
     # (apparaissent entre chaque page dans l'extraction pdfplumber)
     _QONTO_SKIP = re.compile(
         r"^Qonto\s+(SA|est\s+agr[eé]|SAS)|"
         r"^Scann[eé]\s+avec\s+CamScanner|"
-        # En-tête de période répété en bas de chaque page : "Du 01/03/2026 au 31/03/2026"
+        r"^Relevés?\s+de\s+compte(?:\s+Qonto)?$|"
+        r"^Date\s+de\s+valeur(?:\s+Transactions\s+D[eé]bit\s+Cr[eé]dit)?$|"
+        r"^Transactions\s*$|^D[eé]bit\s*$|^Cr[eé]dit\s*$|"
+        # En-têtes de synthèse Qonto scannés : Solde / Entrées / Sorties
+        r"^Solde\s+au\s+\d{2}/\d{2}(?:/\d{4})?\b|"
+        r"^Entr[ée]es?\b|^Sorties?\b|"
+        # En-tête de période répété en haut/bas des pages
         r"^Du\s+\d{2}/\d{2}/\d{4}\s+au\s+\d{2}/\d{2}/\d{4}|"
-        # Ligne de footer avec IBAN entre parenthèses : "(FR76 1695 8000 ...)"
+        # Ligne de footer avec IBAN entre parenthèses : "RS BÂTIMENT (FR76 1695 ...)"
         r"^\S.*\(FR\d{2}\s+\d{4}|"
-        r"^\d+/\d+\s*$|"                    # numéro de page ex: "1/6", "2/6"
+        r"^\d+/\d+\s*$|"
         r"^IBAN\s*:\s*FR|^BIC\s*:\s*QNT|"
         r"si[eè]ge\s+social|numéro\s+16958|au\s+capital\s+de\s+\d|"
-        r"^Relevés?\s+de\s+compte$|"
-        r"^Date\s+de\s+valeur\s*$|^Transactions\s*$|^D[eé]bit\s*$|^Cr[eé]dit\s*$",
+        r"compatibles\s+avec\s+Apple\s+Pay|"
+        r"^Toutes\s+les\s+cartes\s+de\s+votre|"
+        r"^86\s+RUE\s+VOLTAIRE$|^93100,?\s+MONTREUIL|^RS\s+B[ÂA]TIMENT$",
         re.IGNORECASE,
     )
 
@@ -2899,7 +2660,7 @@ def _extract_lcl_opening_balance(pdf_bytes: bytes) -> float | None:
                 boundary = (debit_x + credit_x) / 2
 
                 # ── Chercher la ligne ANCIEN SOLDE ──
-                lines_by_y = _group_by_y(words, y_tol=2.0)
+                lines_by_y = _group_by_y(words, y_tol=4.0)
                 for y_key in sorted(lines_by_y.keys()):
                     line_words = sorted(lines_by_y[y_key], key=lambda w: w["x0"])
                     line_upper = " ".join(w["text"].upper() for w in line_words)
@@ -2952,76 +2713,6 @@ def _extract_lcl_opening_balance(pdf_bytes: bytes) -> float | None:
     return None
 
 
-def _extract_lcl_opening_balance_from_gcv(
-    pages_words: list[list[dict]],
-) -> float | None:
-    """
-    Extrait l'ANCIEN SOLDE LCL depuis les positions de mots Google Cloud Vision.
-
-    Même logique que _extract_lcl_opening_balance() (pdfplumber), mais opère sur
-    les listes de mots GCV déjà normalisées (coordonnées 0-612 x, 0-792 y).
-
-    Sur un relevé LCL scanné :
-      - Solde d'ouverture CRÉDITEUR → montant dans colonne CRÉDIT (x0 ≥ boundary) → +
-      - Solde d'ouverture DÉBITEUR  → montant dans colonne DÉBIT  (x0 < boundary)  → -
-    """
-    for page_words in pages_words:
-        if not page_words:
-            continue
-
-        # ── Détection colonnes DÉBIT / CRÉDIT ──
-        debit_x, credit_x = None, None
-        for w in page_words:
-            txt = w["text"].upper()
-            if re.search(r"D[EÉ]BIT", txt) and not re.search(r"CREDITEUR|DEBUT", txt):
-                if w.get("x0", 0) > 300:
-                    debit_x = w["x0"]
-            if re.search(r"CR[EÉ]DIT", txt) and not re.search(
-                r"CREDITEUR|CREDIT\s+MUTUEL|CREDIT\s+AGRICOLE|CIC", txt
-            ):
-                if w.get("x0", 0) > 380:
-                    credit_x = w["x0"]
-
-        if debit_x is None:
-            debit_x = 437.0
-        if credit_x is None:
-            credit_x = 506.0
-        boundary = (debit_x + credit_x) / 2
-
-        # ── Chercher la ligne ANCIEN SOLDE ──
-        lines_by_y = _group_by_y(page_words, y_tol=2.0)
-        for y_key in sorted(lines_by_y.keys()):
-            line_words = sorted(lines_by_y[y_key], key=lambda w: w["x0"])
-            line_upper = " ".join(w["text"].upper() for w in line_words)
-            if "ANCIEN" not in line_upper or "SOLDE" not in line_upper:
-                continue
-
-            amt_val = _extract_amount_from_zone(line_words, 300.0, 700.0)
-            if amt_val is None:
-                continue
-
-            # Trouver le token principal du montant pour déterminer sa colonne
-            main_amt_word = None
-            for w in reversed(sorted(line_words, key=lambda w: w["x0"])):
-                if re.match(r"^\d{1,4}[,\.]\d{2}$", w["text"].strip()):
-                    main_amt_word = w
-                    break
-
-            if main_amt_word is None:
-                for w in reversed(sorted(line_words, key=lambda w: w["x0"])):
-                    if re.search(r"\d", w["text"]) and w["x0"] > 300:
-                        main_amt_word = w
-                        break
-
-            if main_amt_word is None:
-                return abs(amt_val)  # fallback positif
-
-            if main_amt_word["x0"] >= boundary:
-                return abs(amt_val)    # colonne CRÉDIT → positif
-            else:
-                return -abs(amt_val)   # colonne DÉBIT  → négatif (découvert)
-
-    return None
 
 
 def _extract_amount_from_zone(
@@ -3062,10 +2753,12 @@ def _extract_amount_from_zone(
                 return round(prefix * 1000 + base, 2)
             return round(base, 2)
         # Montant FR avec séparateur millier point : "5.530,00", "1.400,00", "22.380,20"
-        # pdfplumber peut retourner ce token en un seul mot
+        # pdfplumber peut retourner ce token en un seul mot.
+        # Plafond à 500 000 € pour éviter de capter des numéros de référence/SIREN/RCS
+        # ou totaux de bas de page (ex : "2.037.713.591,00") comme montants de transaction.
         if re.match(r"^\d{1,3}(\.\d{3})+,\d{2}$", w["text"]):
             base = clean_amount(w["text"])
-            if base is not None:
+            if base is not None and base <= 500_000:
                 return round(base, 2)
     return None
 
@@ -3105,7 +2798,7 @@ def parse_transactions_from_word_pages(
 ) -> pd.DataFrame:
     """
     Cœur du parser colonne — fonctionne sur des listes de mots ({text, x0, top}).
-    Compatible pdfplumber ET Google Cloud Vision (coordonnées normalisées 0-612).
+    Compatible pdfplumber (coordonnées normalisées 0-612).
     Gère : DD/MM, DD.MM, DD/MM/YY, DD.MM.YY, DD/MM/YYYY.
     """
     if year is None:
@@ -3419,271 +3112,20 @@ def parse_transactions_by_column(pdf_file, y_tol: float = 2.0) -> pd.DataFrame:
 
 
 # =========================================================
-# DÉTECTION : PDF texte natif ou image/scanné ?
+# POINT D'ENTRÉE PRINCIPAL — EXTRACTION INTELLIGENTE
 # =========================================================
 
-def _pdf_has_text(pdf_bytes: bytes) -> bool:
-    try:
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            total_chars = 0
-            for page in pdf.pages:
-                total_chars += len(page.chars)
-                if total_chars > 30:
-                    return True
-        return False
-    except Exception:
-        return False
-
-
-# =========================================================
-# RASTERISATION PDF → IMAGES PIL
-# =========================================================
-
-def _try_pymupdf(pdf_bytes: bytes) -> list | None:
-    from PIL import Image
-    fitz_mod = None
-    for mod_name in ("pymupdf", "fitz"):
-        try:
-            import importlib
-            fitz_mod = importlib.import_module(mod_name)
-            break
-        except ImportError:
-            continue
-    if fitz_mod is None:
-        return None
-    try:
-        doc = fitz_mod.open(stream=pdf_bytes, filetype="pdf")
-        images = []
-        for page in doc:
-            mat = fitz_mod.Matrix(300 / 72, 300 / 72)
-            pix = page.get_pixmap(matrix=mat, colorspace=fitz_mod.csRGB)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            images.append(img.copy())
-        doc.close()
-        return images
-    except Exception as e:
-        st.warning(f"⚠️ PyMuPDF disponible mais erreur : {e}")
-        return None
-
-
-def _try_pdf2image(pdf_bytes: bytes) -> list | None:
-    try:
-        from pdf2image import convert_from_bytes
-        from pdf2image.exceptions import PopplerNotInstalledError, PDFInfoNotInstalledError
-    except ImportError:
-        return None
-    try:
-        return convert_from_bytes(pdf_bytes, dpi=300)
-    except (PopplerNotInstalledError, PDFInfoNotInstalledError):
-        return None
-    except Exception as e:
-        st.warning(f"⚠️ pdf2image erreur : {e}")
-        return None
-
-
-def _try_pdftoppm(pdf_bytes: bytes) -> list | None:
-    import shutil
-    from PIL import Image
-    if not shutil.which("pdftoppm"):
-        return None
-    tmp_pdf_path = None
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_pdf:
-            tmp_pdf.write(pdf_bytes)
-            tmp_pdf_path = tmp_pdf.name
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            prefix = os.path.join(tmp_dir, "page")
-            result = subprocess.run(
-                ["pdftoppm", "-png", "-r", "300", tmp_pdf_path, prefix],
-                capture_output=True,
-                timeout=60,
-            )
-            if result.returncode != 0:
-                st.warning(f"⚠️ pdftoppm : {result.stderr.decode()[:200]}")
-                return None
-            images = []
-            for fname in sorted(os.listdir(tmp_dir)):
-                if fname.endswith(".png"):
-                    with open(os.path.join(tmp_dir, fname), "rb") as f:
-                        img = Image.open(io.BytesIO(f.read()))
-                        images.append(img.copy())
-            return images if images else None
-    except Exception as e:
-        st.warning(f"⚠️ pdftoppm erreur : {e}")
-        return None
-    finally:
-        if tmp_pdf_path:
-            try:
-                os.unlink(tmp_pdf_path)
-            except Exception:
-                pass
-
-
-def _rasterize_pdf_to_images(pdf_bytes: bytes) -> list:
-    for fn in [_try_pymupdf, _try_pdf2image, _try_pdftoppm]:
-        images = fn(pdf_bytes)
-        if images is not None:
-            return images
-    st.error(
-        "❌ **Impossible de rasteriser le PDF** (requis pour les PDF sans texte natif).\n\n"
-        "**Solution recommandée** — installez PyMuPDF :\n"
-        "```\npip install PyMuPDF\n```\n"
-        "**Streamlit Cloud** — ajoutez dans `requirements.txt` :\n"
-        "```\nPyMuPDF\n```"
-    )
-    return []
-
-
-# =========================================================
-# OCR GOOGLE CLOUD VISION API — version structurée
-# =========================================================
-
-def _gcv_extract_words_from_response(gcv_data: dict) -> tuple[str, list[dict]]:
-    """
-    Extrait texte et positions des mots depuis la réponse GCV.
-    Normalise les coordonnées pixel → échelle PDF (0-612 x, 0-792 y).
-    Retourne (full_text, words_list) où chaque mot a {text, x0, top}.
-    """
-    response = gcv_data.get("responses", [{}])[0]
-    full_text = response.get("fullTextAnnotation", {}).get("text", "")
-
-    words: list[dict] = []
-    pages_data = response.get("fullTextAnnotation", {}).get("pages", [])
-
-    for page_data in pages_data:
-        pw = max(page_data.get("width", 1), 1)
-        ph = max(page_data.get("height", 1), 1)
-        scale_x = 612.0 / pw
-        scale_y = 792.0 / ph
-
-        for block in page_data.get("blocks", []):
-            for para in block.get("paragraphs", []):
-                for word in para.get("words", []):
-                    text_w = "".join(
-                        s.get("text", "") for s in word.get("symbols", [])
-                    )
-                    if not text_w.strip():
-                        continue
-                    verts = word.get("boundingBox", {}).get("vertices", [])
-                    if len(verts) >= 2:
-                        xs = [v.get("x", 0) for v in verts]
-                        ys = [v.get("y", 0) for v in verts]
-                        words.append({
-                            "text": text_w,
-                            "x0": min(xs) * scale_x,
-                            "top": min(ys) * scale_y,
-                        })
-
-    return full_text, words
-
-
-def _gcv_ocr_image_structured(image_bytes: bytes, api_key: str) -> tuple[str, list[dict]]:
-    """
-    Envoie une image à Google Cloud Vision et retourne (texte, mots_positionnés).
-    Utilise DOCUMENT_TEXT_DETECTION pour préserver la structure multi-colonnes.
-    """
-    url = f"https://vision.googleapis.com/v1/images:annotate?key={api_key}"
-    payload = {
-        "requests": [
-            {
-                "image": {"content": base64.b64encode(image_bytes).decode("utf-8")},
-                "features": [{"type": "DOCUMENT_TEXT_DETECTION", "maxResults": 1}],
-                "imageContext": {"languageHints": ["fr", "en"]},
-            }
-        ]
-    }
-    try:
-        resp = requests.post(url, json=payload, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
-
-        gcv_err = data.get("responses", [{}])[0].get("error")
-        if gcv_err:
-            st.error(f"Google Vision API : {gcv_err.get('message', 'Erreur inconnue')}")
-            return "", []
-
-        return _gcv_extract_words_from_response(data)
-
-    except requests.exceptions.HTTPError as e:
-        if e.response is not None and e.response.status_code == 400:
-            st.error("❌ Google Vision : requête invalide (400). Vérifiez la clé GCV_API_KEY.")
-        elif e.response is not None and e.response.status_code == 403:
-            st.error("❌ Google Vision : accès refusé (403). Vérifiez les droits / quota de votre clé API.")
-        else:
-            st.error(f"❌ Google Vision HTTP {e}")
-        return "", []
-    except Exception as e:
-        st.error(f"❌ Google Vision : {e}")
-        return "", []
-
-
-def ocr_pdf_gcv(pdf_bytes: bytes) -> tuple[str, list[list[dict]]]:
-    """
-    OCR complet d'un PDF via Google Cloud Vision.
-    Retourne (full_text, pages_words) pour le parser colonne structuré.
-    """
-    api_key = ""
-    try:
-        api_key = st.secrets.get("GCV_API_KEY", "")
-    except Exception:
-        pass
-
-    if not api_key:
-        st.error(
-            "❌ Clé **GCV_API_KEY** absente dans `.streamlit/secrets.toml`.\n\n"
-            "Ajoutez : `GCV_API_KEY = \"votre-clé\"`"
-        )
-        return "", []
-
-    images = _rasterize_pdf_to_images(pdf_bytes)
-    if not images:
-        return "", []
-
-    all_text: list[str] = []
-    all_words_pages: list[list[dict]] = []
-    progress_bar = st.progress(0, text="🔍 OCR en cours…")
-
-    for idx, img in enumerate(images):
-        progress_bar.progress(
-            (idx + 1) / len(images),
-            text=f"🔍 OCR page {idx + 1}/{len(images)}…",
-        )
-        buf = io.BytesIO()
-        img.save(buf, format="PNG")
-        img_bytes = buf.getvalue()
-
-        page_text, page_words = _gcv_ocr_image_structured(img_bytes, api_key)
-        if page_text:
-            all_text.append(page_text)
-        all_words_pages.append(page_words)
-
-    progress_bar.empty()
-    full_text = clean_text("\n".join(all_text))
-    return full_text, all_words_pages
-
-
-# =========================================================
-# BANQUES UTILISANT LE PARSER COLONNE (DÉBIT | CRÉDIT)
-# =========================================================
-
-# Ces banques ont deux colonnes séparées Débit / Crédit sans signe sur les montants.
-# On utilise le parser colonne (pdfplumber ou GCV word positions).
+# Banques dont le parser colonne est le chemin principal
 _COLUMN_BANKS = {
     "BANQUE_POSTALE",
     "CIC",
     "GENERIC",
 }
-# Note : CREDIT_MUTUEL a sa propre branche dans extract_all
-# (filtre section carte + fallback parse_credit_mutuel_text)
-# Note : CREDIT_AGRICOLE a sa propre branche dans extract_all
-# (parse_credit_agricole_text en priorité, parser colonne en fallback)
 
-# Banques avec parser texte dédié (montants signés ou format spécifique)
+# Banques avec parser texte dédié
 _TEXT_BANKS = {
     "BNP_PARIBAS": parse_bnp_paribas_text,
     "REVOLUT": parse_revolut_text,
-    # "SHINE" retiré de _TEXT_BANKS — géré par sa propre branche dans extract_all
-    # (parser colonne en priorité + parse_shine_text en fallback)
     "BANQUE_POPULAIRE": parse_banque_populaire_text,
     "CAISSE_EPARGNE": parse_caisse_epargne_text,
     "QONTO": parse_transactions_text,
@@ -3691,47 +3133,12 @@ _TEXT_BANKS = {
 }
 
 
-# =========================================================
-# POINT D'ENTRÉE PRINCIPAL — EXTRACTION INTELLIGENTE
-# =========================================================
-
-def extract_all_from_image(image_file) -> dict:
+def extract_all(pdf_file) -> dict:
     """
-    Entrée : fichier image (PNG / JPG / JPEG / TIFF / BMP / WEBP).
-    Convertit l'image en PDF mono-page puis lance le pipeline OCR GCV standard.
-    Retourne le même dictionnaire que extract_all().
-    """
-    from PIL import Image as PILImage
-
-    image_file.seek(0)
-    raw_bytes = image_file.read()
-
-    # Convertir l'image en PDF en mémoire via Pillow
-    img = PILImage.open(io.BytesIO(raw_bytes))
-    if img.mode not in ("RGB", "L"):
-        img = img.convert("RGB")
-
-    pdf_buf = io.BytesIO()
-    img.save(pdf_buf, format="PDF", resolution=150)
-    pdf_buf.seek(0)
-    pdf_bytes = pdf_buf.read()
-
-    # Créer un objet compatible seek/read
-    class _BytesIO(io.BytesIO):
-        pass
-
-    fake_pdf = _BytesIO(pdf_bytes)
-    fake_pdf.name = getattr(image_file, "name", "image.pdf").rsplit(".", 1)[0] + ".pdf"
-    return extract_all(fake_pdf, force_ocr=True)
-
-
-def extract_all(pdf_file, force_ocr: bool = False) -> dict:
-    """
-    Orchestre l'extraction complète :
-      1. Lecture bytes + détection texte natif vs image
-      2. Extraction texte (pdfplumber) OU OCR Google Vision (avec mots positionnés)
-      3. Détection banque, IBAN, BIC, soldes
-      4. Dispatch vers le parser approprié :
+    Orchestre l'extraction complète depuis un PDF texte natif :
+      1. Lecture bytes + extraction texte via pdfplumber
+      2. Détection banque, IBAN, BIC, soldes
+      3. Dispatch vers le parser approprié :
          - Parser texte BNP              : BNP Paribas (sections crédit/débit)
          - Parser texte dédié            : Revolut, Shine, Banque Populaire, Caisse Épargne, Qonto
          - Parser colonne (DÉBIT|CRÉDIT) : La Banque Postale, CIC, CM, SG, CA, LCL
@@ -3740,32 +3147,19 @@ def extract_all(pdf_file, force_ocr: bool = False) -> dict:
     pdf_file.seek(0)
     pdf_bytes = pdf_file.read()
 
-    has_text = _pdf_has_text(pdf_bytes) and not force_ocr
-
-    # ── Extraction du texte brut ──
-    ocr_used = False
-    pages_words: list[list[dict]] = []
-
-    if has_text:
-        try:
-            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-                raw_pages = [p.extract_text() for p in pdf.pages if p.extract_text()]
-            raw_text = clean_text("\n".join(raw_pages))
-        except Exception:
-            raw_text = ""
-    else:
-        ocr_used = True
-        raw_text, pages_words = ocr_pdf_gcv(pdf_bytes)
+    # ── Extraction du texte brut via pdfplumber ──
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            raw_pages = [p.extract_text() for p in pdf.pages if p.extract_text()]
+        raw_text = clean_text("\n".join(raw_pages))
+    except Exception:
+        raw_text = ""
 
     bank = detect_bank(raw_text)
     iban, bic = extract_iban_bic(raw_text)
 
     # ── Fallback IBAN Société Générale ──
-    # pdfplumber peut extraire le n° de compte sous différentes formes ;
-    # on tente un 2ème passage avec un pattern élargi spécifique SG.
     if iban is None and bank == "SOCIETE_GENERALE":
-        # Le n° de compte SG apparaît souvent dans le texte brut comme :
-        # "30003 03984 00020307173 48" (sans le préfixe n°)
         m_sg = re.search(
             r"\b(\d{5})\s+(\d{5})\s+(\d{11})\s+(\d{2})\b",
             raw_text,
@@ -3778,7 +3172,6 @@ def extract_all(pdf_file, force_ocr: bool = False) -> dict:
     opening = extract_opening_balance(raw_text)
     closing = extract_closing_balance(raw_text)
 
-    # Année de référence pour les formats DD/MM sans année
     year_ref = _extract_year_from_text(raw_text)
 
     df = pd.DataFrame(columns=["date", "libelle", "montant"])
@@ -3786,59 +3179,19 @@ def extract_all(pdf_file, force_ocr: bool = False) -> dict:
     # ── Dispatch parser ──
 
     if bank == "LCL":
-        # ── Correction solde d'ouverture LCL ──
-        # extract_opening_balance() retourne toujours une valeur positive.
-        # Or LCL place l'ANCIEN SOLDE en colonne DÉBIT quand le compte est à découvert
-        # (solde débiteur) → le solde d'ouverture doit alors être NÉGATIF.
-        if has_text:
-            # PDF texte natif : utilise les positions pdfplumber
-            lcl_opening = _extract_lcl_opening_balance(pdf_bytes)
-            if lcl_opening is not None:
-                opening = lcl_opening
-        elif ocr_used and pages_words:
-            # PDF scanné / image : utilise les positions Google Cloud Vision
-            lcl_opening = _extract_lcl_opening_balance_from_gcv(pages_words)
-            if lcl_opening is not None:
-                opening = lcl_opening
+        # Correction solde d'ouverture LCL (colonne DÉBIT ou CRÉDIT selon découvert)
+        lcl_opening = _extract_lcl_opening_balance(pdf_bytes)
+        if lcl_opening is not None:
+            opening = lcl_opening
 
-        # ── LCL — Cascade de parsers ──
-        #
-        # PDF texte natif :
-        #   1. Parser colonne pdfplumber (DÉBIT | CRÉDIT par position x)
-        #   2. Parser texte dédié LCL (indicateurs "." + mots-clés)
-        #
-        # PDF scanné / image (OCR Google Cloud Vision) :
-        #   1. Parser colonne GCV (positions x/y normalisées 0-612)
-        #   2. Parser LCL dédié OCR (DD.MM|DD/MM + "." colonne + mots-clés enrichis)
-        #   3. Parser LCL texte natif (si OCR très fidèle à la mise en page)
-        #   4. Parser universel (dernier recours)
-        if has_text:
-            # LCL PDF natif : y_tol=4.0 indispensable.
-            # pdfplumber peut placer le montant Débit/Crédit sur une y légèrement
-            # différente de la date (ex : 100 vs 101). Avec y_tol=2.0, round(101/2)*2=102 ≠ 100
-            # → le montant se retrouve dans un groupe différent de la date → la transaction
-            # est flush() sans montant (perdue) quand une ligne LIBELLE:… survient.
-            # Avec y_tol=4.0 : round(101/4)*4=100 → même groupe → montant correctement rattaché.
-            df = parse_transactions_by_column(io.BytesIO(pdf_bytes), y_tol=4.0)
-            if df.empty:
-                df = parse_lcl_text(raw_text, year_ref)
-        elif ocr_used and pages_words:
-            # Priorité 1 : parser colonne GCV (exploite les positions x/y)
-            df = parse_transactions_from_word_pages(
-                pages_words, year=year_ref, y_tol=4.0
-            )
-            if df.empty:
-                # Priorité 2 : parser LCL dédié OCR (robuste aux artefacts OCR)
-                df = parse_lcl_ocr_text(raw_text, year_ref)
-            if df.empty:
-                # Priorité 3 : parser LCL texte natif (fonctionne si OCR très fidèle)
-                df = parse_lcl_text(raw_text, year_ref)
+        # LCL PDF natif : y_tol=4.0 indispensable (montants sur y légèrement différente de la date)
+        df = parse_transactions_by_column(io.BytesIO(pdf_bytes), y_tol=4.0)
+        if df.empty:
+            df = parse_lcl_text(raw_text, year_ref)
         if df.empty:
             df = parse_transactions_text(raw_text, year=year_ref)
 
-        # ── Filtre de sécurité : supprimer les lignes bilan/totaux LCL
-        # (ex : "SOLDE EN EUROS", "SOLDE INTERMEDIAIRE A FIN DECEMBRE", "ANCIEN SOLDE")
-        # Ces lignes ne sont pas de vraies transactions et faussent les totaux.
+        # Filtre lignes bilan/totaux LCL (SOLDE EN EUROS, SOLDE INTERMEDIAIRE, ANCIEN SOLDE)
         if not df.empty:
             _lcl_bilan_mask = df["libelle"].str.contains(
                 r"SOLDE\s+EN\s+EUROS|SOLDE\s+INTERMEDIAIRE|ANCIEN\s+SOLDE",
@@ -3846,139 +3199,56 @@ def extract_all(pdf_file, force_ocr: bool = False) -> dict:
             )
             df = df[~_lcl_bilan_mask].reset_index(drop=True)
 
-    elif bank == "SOCIETE_GENERALE":        # ── Société Générale — Priorité : parser texte dédié SG ──
-        # pdfplumber supprime les espaces entre mots et place le montant sur une
-        # ligne autonome → parse_societe_generale_text est le plus fiable.
-        # Le parser colonne n'est utilisé qu'en OCR (GCV) où les positions x/y sont dispo.
-        if ocr_used and pages_words:
-            # PDF scanné / image → parser colonne GCV (positions x/y)
-            df = parse_transactions_from_word_pages(
-                pages_words, year=year_ref, y_tol=4.0
-            )
-            if df.empty:
-                df = parse_societe_generale_text(raw_text, year_ref)
-        elif has_text:
-            # PDF texte natif → parser texte SG en priorité absolue
-            df = parse_societe_generale_text(raw_text, year_ref)
-            # Fallback colonne si le texte parser échoue
-            if df.empty:
-                df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
-        # Fallback universel
+    elif bank == "SOCIETE_GENERALE":
+        # Parser texte SG en priorité absolue
+        df = parse_societe_generale_text(raw_text, year_ref)
+        if df.empty:
+            df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
         if df.empty:
             df = parse_transactions_text(raw_text, year=year_ref)
 
     elif bank == "SHINE":
-        # ── Shine — Parser colonne en priorité (PDF texte natif) ──
-        #
-        # Shine structure ses relevés avec DEUX colonnes séparées Débit / Crédit
-        # (sans signe sur les montants). Le parser texte (parse_shine_text) ne peut
-        # pas distinguer les deux colonnes — il utilisait l'heuristique "De :" pour
-        # détecter les virements entrants, manquant tous les remboursements carte
-        # (ex : WORLD EDUCATION SERV, CERBA…) dont les montants tombent en colonne
-        # Crédit (x0 ≈ 535-545) mais n'ont pas de "De :" dans le libellé.
-        #
-        # parse_transactions_by_column_shine :
-        #   - Pré-filtre les mots pdfplumber (_prefilter_shine_words) :
-        #       supprime en-têtes répétés, pieds légaux, ligne "Solde au",
-        #       mots de type isolés ("Virement" / "instantané" sur ligne seule)
-        #   - Puis appelle le parser colonne avec y_tol=3.0
-        #
-        # Positions x relevé Shine :
-        #   - Débit  header x0=457 x1=477  → montants x0 ≈ 480-490
-        #   - Crédit header x0=515         → montants x0 ≈ 535-545
-        #   - boundary = (477 + 515) / 2 ≈ 496 → séparation nette
-        if has_text:
-            df = parse_transactions_by_column_shine(io.BytesIO(pdf_bytes))
-            if df.empty:
-                df = parse_shine_text(raw_text)
-        elif ocr_used and pages_words:
-            # OCR : pas de filtre de mots GCV (les en-têtes sont généralement
-            # absents des blocs OCR structurés) ; on préfiltre quand même par sécurité
-            filtered_gcv = _prefilter_shine_words(pages_words)
-            df = parse_transactions_from_word_pages(filtered_gcv, year=year_ref, y_tol=3.0)
-            if df.empty:
-                df = parse_shine_text(raw_text)
+        # Parser colonne en priorité (colonnes Débit/Crédit séparées sans signe)
+        df = parse_transactions_by_column_shine(io.BytesIO(pdf_bytes))
+        if df.empty:
+            df = parse_shine_text(raw_text)
         if df.empty:
             df = parse_transactions_text(raw_text, year=year_ref)
 
     elif bank in _TEXT_BANKS:
-        # Parsers texte dédiés (signés ou format spécifique)
         parser_fn = _TEXT_BANKS[bank]
-        # Passer year si la fonction l'accepte (Shine, Qonto n'en ont pas besoin)
         try:
             df = parser_fn(raw_text, year_ref)
         except TypeError:
             df = parser_fn(raw_text)
-
-        # Fallback column parser pour BNP si le texte parser échoue
         if df.empty and bank == "BNP_PARIBAS":
-            if has_text:
-                df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
-            if df.empty:
-                df = parse_transactions_text(raw_text, year=year_ref)
+            df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
+        if df.empty:
+            df = parse_transactions_text(raw_text, year=year_ref)
 
     elif bank == "CREDIT_AGRICOLE":
-        # ── Crédit Agricole (Brie Picardie & variantes régionales) ──
-        # Priorité 1 : parser colonne pdfplumber (PDF texte natif)
-        #   → utilise les positions x des mots pour distinguer colonne Débit / Crédit
-        #   → le plus fiable car indépendant du contenu textuel des libellés
-        # Priorité 2 : parser texte dédié CA
-        #   → dates DD.MM, détection débit/crédit par mots-clés d'opération
-        #   → utilisé pour les PDF OCR ou si le parser colonne échoue
-        # Priorité 3 : parser texte universel (fallback ultime)
-        if has_text:
-            df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
-            if df.empty:
-                df = parse_credit_agricole_text(raw_text, year_ref)
-        elif ocr_used and pages_words:
-            df = parse_transactions_from_word_pages(
-                pages_words, year=year_ref, y_tol=4.0
-            )
-            if df.empty:
-                df = parse_credit_agricole_text(raw_text, year_ref)
+        df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
+        if df.empty:
+            df = parse_credit_agricole_text(raw_text, year_ref)
         if df.empty:
             df = parse_transactions_text(raw_text, year=year_ref)
 
     elif bank == "CREDIT_MUTUEL":
-        # ── Crédit Mutuel ──
-        # Priorité 1 : parser colonne pdfplumber (PDF texte natif)
-        #   → le filtre "section carte" garantit l'exclusion des lignes carte
-        # Priorité 2 : parser texte dédié CM (heuristique débit/crédit par mots-clés)
-        # Priorité 3 : parser texte universel (fallback)
-        if ocr_used and pages_words:
-            df = parse_transactions_from_word_pages(
-                pages_words, year=year_ref, y_tol=4.0
-            )
-            if df.empty:
-                df = parse_credit_mutuel_text(raw_text, year_ref)
-        elif has_text:
-            df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
-            if df.empty:
-                df = parse_credit_mutuel_text(raw_text, year_ref)
-
+        df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
+        if df.empty:
+            df = parse_credit_mutuel_text(raw_text, year_ref)
         if df.empty:
             df = parse_transactions_text(raw_text, year=year_ref)
 
     elif bank in _COLUMN_BANKS:
-        # Parser colonne débit/crédit
-        if ocr_used and pages_words:
-            # GCV → mots positionnés → parser colonne structuré
-            df = parse_transactions_from_word_pages(
-                pages_words, year=year_ref, y_tol=4.0
-            )
-        elif has_text:
-            # PDF texte natif → pdfplumber
-            df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
-
-        # Fallback texte universel si parser colonne échoue
+        df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
         if df.empty:
             df = parse_transactions_text(raw_text, year=year_ref)
 
     else:
         # Banques non reconnues / GENERIC
-        if has_text:
-            df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
-        else:
+        df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
+        if df.empty:
             df = parse_transactions_text(raw_text, year=year_ref)
 
     return {
@@ -3989,7 +3259,6 @@ def extract_all(pdf_file, force_ocr: bool = False) -> dict:
         "opening": opening,
         "closing": closing,
         "df": df,
-        "ocr_used": ocr_used,
     }
 
 
@@ -4086,215 +3355,896 @@ def generate_ofx(
     return "\n".join(lines)
 
 
+
 # =========================================================
 # INTERFACE STREAMLIT
 # =========================================================
 
-def main():
-    
-    st.markdown("""
+def inject_custom_ui() -> None:
+    st.markdown(
+        """
         <style>
-            /* Animation douce */
-            @keyframes fadeIn {
-                from {opacity: 0; transform: translateY(10px);}
-                to {opacity: 1; transform: translateY(0);}
-            }
-
-        .block-container {
-            animation: fadeIn 0.6s ease-in-out;
+        :root {
+            --bg-1: #07111f;
+            --bg-2: #0b1f3a;
+            --bg-3: #102d52;
+            --glass: rgba(255,255,255,0.08);
+            --glass-strong: rgba(255,255,255,0.12);
+            --stroke: rgba(255,255,255,0.14);
+            --text: #eef4ff;
+            --muted: #b8c7df;
+            --accent: #53e0c2;
+            --accent-2: #7c8cff;
+            --accent-3: #ff8a5b;
+            --success: #34d399;
+            --danger: #fb7185;
+            --warning: #fbbf24;
+            --shadow: 0 20px 60px rgba(3, 8, 20, 0.35);
+            --radius-xl: 24px;
+            --radius-lg: 18px;
         }
 
-        /* Boutons plus stylés */
-            .stButton>button {
-                border-radius: 10px;
-                transition: 0.3s;
-            }
-        .stButton>button:hover {
-            transform: scale(1.05);
+        header[data-testid="stHeader"],
+        [data-testid="stToolbar"],
+        [data-testid="stDecoration"],
+        #MainMenu,
+        footer {
+            display: none !important;
+            visibility: hidden !important;
+            height: 0 !important;
+        }
+
+        .stApp {
+            background:
+                radial-gradient(circle at 10% 20%, rgba(83,224,194,0.18), transparent 22%),
+                radial-gradient(circle at 90% 15%, rgba(124,140,255,0.18), transparent 24%),
+                radial-gradient(circle at 80% 80%, rgba(255,138,91,0.12), transparent 24%),
+                linear-gradient(135deg, var(--bg-1) 0%, var(--bg-2) 45%, var(--bg-3) 100%);
+            color: var(--text);
+            overflow-x: hidden;
+        }
+
+        .stApp::before,
+        .stApp::after {
+            content: "";
+            position: fixed;
+            inset: auto;
+            width: 34rem;
+            height: 34rem;
+            border-radius: 999px;
+            filter: blur(80px);
+            z-index: 0;
+            pointer-events: none;
+            opacity: 0.35;
+            animation: floatBlob 12s ease-in-out infinite;
+        }
+
+        .stApp::before {
+            top: -8rem;
+            right: -10rem;
+            background: rgba(83, 224, 194, 0.22);
+        }
+
+        .stApp::after {
+            left: -10rem;
+            bottom: -10rem;
+            background: rgba(124, 140, 255, 0.20);
+            animation-delay: 2s;
+        }
+
+        @keyframes floatBlob {
+            0%, 100% { transform: translate3d(0, 0, 0) scale(1); }
+            50% { transform: translate3d(0, 22px, 0) scale(1.08); }
+        }
+
+        @keyframes fadeUp {
+            from { opacity: 0; transform: translateY(18px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes pulseGlow {
+            0%, 100% { box-shadow: 0 0 0 rgba(83,224,194,0.0); }
+            50% { box-shadow: 0 0 32px rgba(83,224,194,0.18); }
+        }
+
+        .main .block-container {
+            position: relative;
+            z-index: 1;
+            padding-top: 0.25rem;
+            padding-bottom: 2.5rem;
+            max-width: 1380px;
+            animation: fadeUp 0.8s ease;
+        }
+
+        .stExpander {
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.09);
+            border-radius: 18px;
+            overflow: hidden;
+            box-shadow: var(--shadow);
+        }
+
+        .stExpander details summary p {
+            font-weight: 700;
+            color: var(--text) !important;
+        }
+
+        [data-testid="stFileUploader"] {
+            background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.04));
+            border: 1px dashed rgba(124,140,255,0.45);
+            border-radius: 22px;
+            padding: 0.6rem;
+            box-shadow: var(--shadow);
+            animation: pulseGlow 7s ease-in-out infinite;
+        }
+
+        [data-testid="stFileUploader"] section {
+            background: transparent;
+        }
+
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 0.6rem;
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 18px;
+            padding: 0.35rem;
+        }
+
+        .stTabs [data-baseweb="tab"] {
+            height: 3rem;
+            border-radius: 14px;
+            background: transparent;
+            color: var(--muted);
+            transition: all 0.25s ease;
+            font-weight: 700;
+        }
+
+        .stTabs [aria-selected="true"] {
+            background: linear-gradient(135deg, rgba(83,224,194,0.18), rgba(124,140,255,0.20)) !important;
+            color: var(--text) !important;
+            border: 1px solid rgba(255,255,255,0.10);
+        }
+
+        .stDataFrame, div[data-testid="stMetric"] {
+            animation: fadeUp 0.55s ease;
+        }
+
+        [data-testid="stSidebar"] {
+            background:
+                linear-gradient(180deg, rgba(7,17,31,0.98), rgba(11,31,58,0.96)),
+                rgba(255,255,255,0.02);
+            border-right: 1px solid rgba(255,255,255,0.08);
+        }
+
+        [data-testid="stSidebar"] * {
+            color: #eef4ff !important;
+        }
+
+        .sidebar-card {
+            background: linear-gradient(180deg, rgba(255,255,255,0.10), rgba(255,255,255,0.05));
+            border: 1px solid rgba(255,255,255,0.10);
+            backdrop-filter: blur(14px);
+            border-radius: 20px;
+            padding: 1.15rem 1rem;
+            box-shadow: var(--shadow);
+        }
+
+        .hero-shell {
+            position: relative;
+            overflow: hidden;
+            background:
+                linear-gradient(135deg, rgba(255,255,255,0.11), rgba(255,255,255,0.05)),
+                linear-gradient(120deg, rgba(83,224,194,0.11), rgba(124,140,255,0.10));
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 28px;
+            padding: 1.5rem 1.5rem 1.3rem 1.5rem;
+            backdrop-filter: blur(18px);
+            box-shadow: var(--shadow);
+            animation: fadeUp 0.9s ease, pulseGlow 6s ease-in-out infinite;
+        }
+
+        .hero-shell::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background:
+                radial-gradient(circle at top right, rgba(255,255,255,0.16), transparent 25%),
+                linear-gradient(90deg, transparent, rgba(255,255,255,0.06), transparent);
+            transform: translateX(-100%);
+            animation: sheen 8s linear infinite;
+        }
+
+        @keyframes sheen {
+            100% { transform: translateX(100%); }
+        }
+
+        .badge-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.55rem;
+            margin-bottom: 0.9rem;
+        }
+
+        .soft-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.35rem;
+            padding: 0.42rem 0.78rem;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.10);
+            border: 1px solid rgba(255,255,255,0.12);
+            color: var(--text);
+            font-size: 0.82rem;
+            font-weight: 600;
+            backdrop-filter: blur(10px);
+        }
+
+        .hero-title {
+            margin: 0;
+            font-size: clamp(2rem, 3vw, 3.3rem);
+            line-height: 1.02;
+            letter-spacing: -0.03em;
+            color: white;
+            font-weight: 800;
+        }
+
+        .hero-subtitle {
+            margin: 0.9rem 0 1.1rem 0;
+            color: var(--muted);
+            font-size: 1rem;
+            line-height: 1.65;
+            max-width: 58rem;
+        }
+
+        .hero-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+            gap: 0.9rem;
+            margin-top: 1rem;
+        }
+
+        .kpi-card,
+        .glass-card,
+        .info-panel,
+        .cta-card {
+            background: linear-gradient(180deg, rgba(255,255,255,0.11), rgba(255,255,255,0.05));
+            border: 1px solid var(--stroke);
+            border-radius: var(--radius-lg);
+            padding: 1rem 1rem 0.95rem 1rem;
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(14px);
+        }
+
+        .kpi-card {
+            min-height: 118px;
+            transition: transform .25s ease, border-color .25s ease, box-shadow .25s ease;
+        }
+
+        .kpi-card:hover,
+        .glass-card:hover,
+        .info-panel:hover {
+            transform: translateY(-4px);
+            border-color: rgba(83,224,194,0.35);
+        }
+
+        .kpi-label {
+            color: var(--muted);
+            font-size: 0.84rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.5rem;
+        }
+
+        .kpi-value {
+            color: white;
+            font-size: 1.7rem;
+            line-height: 1.1;
+            font-weight: 800;
+            margin-bottom: 0.25rem;
+        }
+
+        .kpi-note {
+            color: #dce7ff;
+            font-size: 0.88rem;
+        }
+
+        .section-title {
+            font-size: 1.08rem;
+            font-weight: 750;
+            color: white;
+            margin: 0 0 0.85rem 0;
+        }
+
+        .section-subtitle {
+            color: var(--muted);
+            margin-top: -0.2rem;
+            margin-bottom: 1rem;
+            font-size: 0.95rem;
+        }
+
+        .feature-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 0.9rem;
+            margin-top: 1rem;
+        }
+
+        .feature-card {
+            background: linear-gradient(180deg, rgba(255,255,255,0.09), rgba(255,255,255,0.04));
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: 18px;
+            padding: 1rem;
+            min-height: 120px;
+            transition: transform .25s ease, border-color .25s ease;
+        }
+
+        .feature-card:hover { transform: translateY(-5px); border-color: rgba(124,140,255,0.34); }
+        .feature-card .icon { font-size: 1.5rem; margin-bottom: 0.5rem; }
+        .feature-card .title { font-weight: 700; color: white; margin-bottom: 0.35rem; }
+        .feature-card .text { color: var(--muted); font-size: 0.92rem; line-height: 1.5; }
+
+        div[data-testid="stFileUploader"] > section,
+        div[data-testid="stTextInput"] > div,
+        div[data-testid="stNumberInput"] > div,
+        .stDataFrame,
+        div[data-baseweb="select"] > div,
+        .stTabs [data-baseweb="tab-list"] {
+            background: rgba(255,255,255,0.05) !important;
+            border: 1px solid rgba(255,255,255,0.10) !important;
+            border-radius: 18px !important;
+            backdrop-filter: blur(12px);
+        }
+
+        .stTabs [data-baseweb="tab"] {
+            color: #dfe7fb;
+            font-weight: 700;
+            border-radius: 14px;
+            padding: 0.6rem 0.9rem;
+        }
+
+        .stTabs [aria-selected="true"] {
+            background: linear-gradient(90deg, rgba(83,224,194,0.18), rgba(124,140,255,0.18)) !important;
+            color: white !important;
+        }
+
+        .stButton > button,
+        .stDownloadButton > button {
+            border: 0 !important;
+            border-radius: 16px !important;
+            padding: 0.8rem 1.15rem !important;
+            font-weight: 800 !important;
+            color: white !important;
+            background: linear-gradient(135deg, #18c9a7, #5f7cff, #ff8a5b) !important;
+            background-size: 200% 200% !important;
+            box-shadow: 0 16px 35px rgba(13, 24, 55, 0.35) !important;
+            transition: transform .22s ease, box-shadow .22s ease !important;
+            animation: gradientShift 8s ease infinite;
+        }
+
+        .stButton > button:hover,
+        .stDownloadButton > button:hover {
+            transform: translateY(-2px) scale(1.01);
+            box-shadow: 0 22px 40px rgba(13, 24, 55, 0.45) !important;
+        }
+
+        @keyframes gradientShift {
+            0% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
+        }
+
+        div[data-testid="stMetric"] {
+            background: linear-gradient(180deg, rgba(255,255,255,0.11), rgba(255,255,255,0.05));
+            border: 1px solid rgba(255,255,255,0.10);
+            padding: 1rem;
+            border-radius: 18px;
+            box-shadow: var(--shadow);
+        }
+
+        div[data-testid="stMetric"] label, div[data-testid="stMetric"] * {
+            color: white !important;
+        }
+
+        .status-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.4rem;
+            border-radius: 999px;
+            padding: 0.42rem 0.74rem;
+            font-size: 0.84rem;
+            font-weight: 700;
+            background: rgba(255,255,255,0.08);
+            border: 1px solid rgba(255,255,255,0.10);
+            color: white;
+            margin-top: 0.25rem;
+        }
+
+        .footer-note {
+            text-align: center;
+            color: #b8c7df;
+            font-size: 0.88rem;
+            margin-top: 1.4rem;
+        }
+
+        .small-muted { color: var(--muted); font-size: 0.9rem; }
+        .accent { color: var(--accent); }
+        .danger { color: var(--danger); }
+        .success { color: var(--success); }
+        .warning { color: var(--warning); }
+
+        .stAlert {
+            border-radius: 18px !important;
+            border: 1px solid rgba(255,255,255,0.10) !important;
+            backdrop-filter: blur(10px);
+        }
+
+        [data-testid="stExpander"] {
+            background: rgba(255,255,255,0.05);
+            border-radius: 18px;
+            border: 1px solid rgba(255,255,255,0.10);
+            overflow: hidden;
+        }
+
+        /* ── File uploader "Browse files" button ── */
+        [data-testid="stFileUploader"] button {
+            background: linear-gradient(135deg, #18c9a7, #5f7cff) !important;
+            color: white !important;
+            font-weight: 800 !important;
+            border: none !important;
+            border-radius: 14px !important;
+            padding: 0.55rem 1.2rem !important;
+            box-shadow: 0 8px 24px rgba(95,124,255,0.35) !important;
+            transition: transform .2s ease, box-shadow .2s ease !important;
+        }
+        [data-testid="stFileUploader"] button:hover {
+            transform: translateY(-2px) scale(1.02) !important;
+            box-shadow: 0 14px 32px rgba(95,124,255,0.5) !important;
+        }
+
+        /* ── File uploader drag label ── */
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] p,
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] span,
+        [data-testid="stFileUploaderDropzoneInstructions"] div span,
+        [data-testid="stFileUploaderDropzoneInstructions"] div small {
+            color: rgba(220,230,255,0.85) !important;
+            font-weight: 600 !important;
+        }
+
+        /* ── Stat totals row — wow cards ── */
+        .stat-wow-row {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 1rem;
+            margin: 1rem 0;
+        }
+        .stat-wow {
+            border-radius: 22px;
+            padding: 1.2rem 1rem;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+            backdrop-filter: blur(14px);
+            border: 1px solid rgba(255,255,255,0.13);
+            box-shadow: 0 8px 28px rgba(0,0,0,0.28);
+            transition: transform .25s ease, box-shadow .25s ease;
+            animation: fadeUp 0.6s ease;
+        }
+        .stat-wow:hover { transform: translateY(-5px); box-shadow: 0 16px 40px rgba(0,0,0,0.4); }
+        .stat-wow.credit  { background: linear-gradient(135deg, rgba(24,201,167,0.22), rgba(24,201,167,0.08)); }
+        .stat-wow.debit   { background: linear-gradient(135deg, rgba(255,100,100,0.22), rgba(255,100,100,0.08)); }
+        .stat-wow.solde   { background: linear-gradient(135deg, rgba(124,140,255,0.22), rgba(124,140,255,0.08)); }
+        .stat-wow.ecart   { background: linear-gradient(135deg, rgba(255,193,60,0.22), rgba(255,193,60,0.08)); }
+        .stat-wow.ecart-ok { background: linear-gradient(135deg, rgba(24,201,167,0.22), rgba(24,201,167,0.08)); }
+        .stat-wow-icon { font-size: 1.6rem; margin-bottom: 0.3rem; }
+        .stat-wow-label {
+            color: rgba(200,215,255,0.75);
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            font-weight: 700;
+            margin-bottom: 0.4rem;
+        }
+        .stat-wow-value {
+            font-size: 1.65rem;
+            font-weight: 900;
+            line-height: 1.1;
+            color: white;
+            letter-spacing: -0.02em;
+            margin-bottom: 0.3rem;
+        }
+        .stat-wow-value.credit { color: #18c9a7; }
+        .stat-wow-value.debit  { color: #ff6464; }
+        .stat-wow-value.solde  { color: #a5b4fc; }
+        .stat-wow-value.ecart  { color: #ffc13c; }
+        .stat-wow-value.ecart-ok { color: #18c9a7; }
+        .stat-wow-note { color: rgba(200,215,255,0.55); font-size: 0.82rem; }
+
+        /* ── Upload CTA info box ── */
+        .upload-cta {
+            background: linear-gradient(135deg, rgba(15,28,55,0.85), rgba(20,38,75,0.80));
+            border: 1px solid rgba(124,140,255,0.28);
+            border-radius: 20px;
+            padding: 1.1rem 1.4rem;
+            text-align: center;
+            color: #c8d8ff;
+            font-size: 1rem;
+            font-weight: 600;
+            margin-top: 0.8rem;
+            backdrop-filter: blur(12px);
+        }
+        .upload-cta a { color: #7cc4ff; text-decoration: underline dotted; }
+
+        /* ── Dataframe tweaks ── */
+        .stDataFrame iframe { border-radius: 16px !important; }
+        [data-testid="stDataFrameResizable"] { border-radius: 16px !important; overflow: hidden; }
+
+        @media (max-width: 768px) {
+            .stat-wow-row { grid-template-columns: repeat(2, 1fr); }
+            .stat-wow-value { font-size: 1.3rem; }
         }
         </style>
-    """, unsafe_allow_html=True)
-    
-    
-    st.sidebar.markdown("""
-        ### 👨‍💻 À propos
-
-        **Achraf BEN YOUNES**  
-        🚀 Data & AI Engineer  
-
-        ---
-
-        📞 **Contact**  
-        🇫🇷 07 60 93 53 71  
-
-        📧 **Email**  
-        achrafbenyounes2012@gmail.com  
-
-        ---
-
-            © 2026 Achraf BEN YOUNES  
-        """)
-    
-    st.title("💳 OFX Converter Pro — Multi-banques France → Odoo")
-    
-    st.caption(
-        "Compatible : La Banque Postale · BNP Paribas · Crédit Agricole · Société Générale · "
-        "CIC · Crédit Mutuel · LCL · Caisse d'Épargne · Banque Populaire · "
-        "Qonto · Revolut Business · Shine · **Finom**  |  "
-        "**OCR automatique** (PDF scannés & Print-to-PDF)"
-    )
-    
-    st.markdown("""
-        <p style='font-size:16px; color:gray;'>
-        Convertissez automatiquement vos relevés bancaires en format OFX compatible Odoo — 
-        <span style='color:#4CAF50; font-weight:bold;'>rapide, fiable et intelligent</span>.
-        </p>
-        """, unsafe_allow_html=True)
-
-    # ── Upload : PDF, images scannées, photos de relevés ──
-    _IMAGE_TYPES = ["png", "jpg", "jpeg", "tiff", "tif", "bmp", "webp"]
-    uploaded = st.file_uploader(
-        "📁 Déposer le relevé bancaire (PDF ou image scannée)",
-        type=["pdf"] + _IMAGE_TYPES,
-        help="Formats acceptés : PDF natif, PDF scanné, PNG, JPG, JPEG, TIFF, BMP, WEBP",
+        """,
+        unsafe_allow_html=True,
     )
 
-    col_force, _ = st.columns([2, 5])
-    with col_force:
-        force_ocr = st.checkbox(
-            "🔎 Forcer OCR (Google Vision)",
-            value=False,
-            help=(
-                "Cochez si le PDF est imprimé/scanné mais détecté à tort comme 'texte natif'. "
-                "L'OCR sera appliqué même si le PDF contient du texte extractible."
-            ),
+
+def render_hero() -> None:
+    st.markdown(
+        """
+        <section class="hero-shell">
+            <div class="badge-row">
+                <span class="soft-badge">🏦 Multi-banques FR</span>
+                <span class="soft-badge">📦 Export OFX pour Odoo</span>
+                <span class="soft-badge">⚡ Extraction rapide</span>
+            </div>
+            <h1 class="hero-title">OFX Converter Pro</h1>
+            <p class="hero-subtitle">
+                Une expérience comptable moderne, immersive et rassurante :
+                animations fluides, feedback visuel instantané, lecture facilitée et parcours
+                d’import ultra-clair pour transformer un relevé bancaire en fichier OFX propre.
+            </p>
+            <div class="hero-grid">
+                <div class="kpi-card">
+                    <div class="kpi-label">Banques supportées</div>
+                    <div class="kpi-value">15+</div>
+                    <div class="kpi-note">France, néobanques et pros</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Stratégies</div>
+                    <div class="kpi-value">3 couches</div>
+                    <div class="kpi-note">Colonne, texte dédié, fallback regex</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Objectif UX</div>
+                    <div class="kpi-value">Ultra fluide</div>
+                    <div class="kpi-note">Moins de friction, plus de confiance</div>
+                </div>
+                <div class="kpi-card">
+                    <div class="kpi-label">Résultat</div>
+                    <div class="kpi-value">OFX prêt</div>
+                    <div class="kpi-note">Compatible Odoo 14 à 17+</div>
+                </div>
+            </div>
+        </section>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_feature_band() -> None:
+    st.markdown(
+        """
+        <div class="feature-grid">
+            <div class="feature-card">
+                <div class="icon">📤</div>
+                <div class="title">Upload guidé</div>
+                <div class="text">Zone de dépôt élégante, lisible et rassurante pour lancer la conversion sans hésitation.</div>
+            </div>
+            <div class="feature-card">
+                <div class="icon">🧠</div>
+                <div class="title">Détection intelligente</div>
+                <div class="text">Banque, IBAN, BIC, soldes et transactions sont extraits avec plusieurs stratégies complémentaires.</div>
+            </div>
+            <div class="feature-card">
+                <div class="icon">📊</div>
+                <div class="title">Lecture instantanée</div>
+                <div class="text">Les indicateurs clés sont mis en avant avec des cartes animées pour une compréhension immédiate.</div>
+            </div>
+            <div class="feature-card">
+                <div class="icon">🚀</div>
+                <div class="title">Export premium</div>
+                <div class="text">Le fichier OFX est généré dans un parcours clair, avec aperçu et contrôle final des données.</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_info_card(title: str, value: str, emoji: str = "ℹ️") -> None:
+    st.markdown(
+        f"""
+        <div class="info-panel">
+            <div class="section-title">{emoji} {title}</div>
+            <div class="small-muted" style="word-break:break-word;">{value}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_stat_card(label: str, value: str, note: str, tone: str = "neutral") -> None:
+    tone_class = {
+        "success": "success",
+        "danger": "danger",
+        "warning": "warning",
+        "neutral": "accent",
+    }.get(tone, "accent")
+    st.markdown(
+        f"""
+        <div class="kpi-card">
+            <div class="kpi-label">{label}</div>
+            <div class="kpi-value {tone_class}">{value}</div>
+            <div class="kpi-note">{note}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_sidebar() -> None:
+    with st.sidebar:
+        st.markdown(
+            """
+            <div class="sidebar-card">
+                <div class="section-title">👨‍💻 À propos</div>
+                <div class="small-muted"><strong>Achraf BEN YOUNES</strong><br>🚀 Data & AI Engineer</div>
+                <div style="height:10px"></div>
+                <div class="section-title">📞 Contact</div>
+                <div class="small-muted">🇫🇷 07 60 93 53 71</div>
+                <div style="height:10px"></div>
+                <div class="section-title">📧 Email</div>
+                <div class="small-muted">achrafbenyounes2012@gmail.com</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown("")
+        st.markdown(
+            """
+            <div class="glass-card">
+                <div class="section-title">🧭 Conseils UX</div>
+                <div class="small-muted">
+                    • Déposez un PDF natif pour une extraction plus rapide.<br>
+                    • Utilisez un PDF téléchargé depuis votre espace bancaire.<br>
+                    • Vérifiez le solde calculé avant l’export.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
+
+def main():
+    inject_custom_ui()
+    render_sidebar()
+    render_hero()
+
+    st.markdown("<div style=’height: 8px’></div>", unsafe_allow_html=True)
+
+    uploaded = st.file_uploader(
+        "📁 Déposer le relevé bancaire (PDF)",
+        type=["pdf"],
+        help="Format accepté : PDF texte natif (relevé téléchargé depuis votre espace bancaire)",
+    )
+
     if not uploaded:
-        st.info("Importez un relevé bancaire (PDF ou image) pour commencer.")
+        st.markdown(
+            """
+            <div class="upload-cta">
+                Importez un relevé bancaire pour lancer <strong>l’analyse automatique</strong>.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         return
 
     safe_name = sanitize_filename(uploaded.name)
     if safe_name != uploaded.name:
         st.caption(f"📄 Fichier reçu : `{uploaded.name}` → normalisé en `{safe_name}`")
 
-    file_ext = uploaded.name.rsplit(".", 1)[-1].lower()
-    is_image_file = file_ext in _IMAGE_TYPES
-
     with st.spinner("🔍 Analyse du relevé en cours…"):
-        if is_image_file:
-            result = extract_all_from_image(uploaded)
-        else:
-            result = extract_all(uploaded, force_ocr=force_ocr)
+        result = extract_all(uploaded)
 
-    if is_image_file:
-        st.info(f"🖼️ Image détectée ({file_ext.upper()}) — conversion puis OCR via **Google Cloud Vision**")
-
-    bank     = result["bank"]
-    iban     = result["iban"]
-    bic      = result["bic"]
-    opening  = result["opening"]
-    closing  = result["closing"]
-    df       = result["df"]
-    ocr_used = result["ocr_used"]
+    bank = result["bank"]
+    iban = result["iban"]
+    bic = result["bic"]
+    opening = result["opening"]
+    closing = result["closing"]
+    df = result["df"]
     raw_text = result["raw_text"]
 
-    if ocr_used and not is_image_file:
-        st.info("🔎 PDF image/scanné détecté — extraction via **Google Cloud Vision**")
-    elif not is_image_file and force_ocr:
-        st.info("🔎 Mode OCR forcé — extraction via **Google Cloud Vision**")
+    st.markdown("<div style='height: 10px'></div>", unsafe_allow_html=True)
 
-    # ══════════ SECTION 1 : INFORMATIONS COMPTE ══════════
-    st.subheader("🏦 Informations du compte")
-    c1, c2, c3 = st.columns(3)
-    c1.info(f"**Banque détectée**\n\n{bank}")
-    c2.info(f"**IBAN**\n\n`{iban or 'Non détecté'}`")
-    c3.info(f"**BIC**\n\n`{bic or 'Non détecté'}`")
+    top_tabs = st.tabs(["Vue d’ensemble", "Transactions", "Export OFX", "Debug"])
 
-    # ══════════ SECTION 2 : SOLDES ══════════
-    st.subheader("💰 Soldes")
-    col_o, col_c = st.columns(2)
-    with col_o:
-        opening_balance = st.number_input(
-            "Solde d'ouverture (€)",
-            value=float(opening) if opening is not None else 0.0,
-            format="%.2f",
-            step=0.01,
-            help="Extrait automatiquement du relevé. Modifiable si nécessaire.",
+    with top_tabs[0]:
+        st.markdown(
+            """
+            <div class="section-title">🏦 Informations du compte</div>
+            <div class="section-subtitle">Les métadonnées détectées sont présentées dans des cartes lisibles.</div>
+            """,
+            unsafe_allow_html=True,
         )
-    with col_c:
-        if closing is not None:
-            st.metric("Solde de clôture extrait (€)", f"{closing:.2f}")
+        i1, i2, i3 = st.columns(3, gap="large")
+        with i1:
+            render_info_card("Banque détectée", bank or "Non détectée", "🏦")
+        with i2:
+            render_info_card("IBAN", iban or "Non détecté", "💳")
+        with i3:
+            render_info_card("BIC", bic or "Non détecté", "🏷️")
+
+        st.markdown("<div style='height: 8px'></div>", unsafe_allow_html=True)
+        st.markdown(
+            """
+            <div class="section-title">💰 Pilotage des soldes</div>
+            <div class="section-subtitle">Corrigez le solde d’ouverture si nécessaire et contrôlez l’écart final.</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        col_o, col_c = st.columns([1.2, 1], gap="large")
+        with col_o:
+            opening_balance = st.number_input(
+                "Solde d'ouverture (€)",
+                value=float(opening) if opening is not None else 0.0,
+                format="%.2f",
+                step=0.01,
+                help="Extrait automatiquement du relevé. Modifiable si nécessaire.",
+            )
+        with col_c:
+            if closing is not None:
+                st.metric("Solde de clôture extrait (€)", f"{closing:.2f}")
+            else:
+                st.warning("Solde de clôture non détecté dans le PDF")
+
+        if df.empty:
+            st.error("❌ Aucune transaction détectée. Vérifiez le format du PDF.")
         else:
-            st.warning("Solde de clôture non détecté dans le PDF")
+            total_credit = df[df["montant"] > 0]["montant"].sum()
+            total_debit = df[df["montant"] < 0]["montant"].sum()
+            solde_calcule = opening_balance + total_credit + total_debit
+            delta = abs(solde_calcule - closing) if closing is not None else None
 
-    # ══════════ SECTION 3 : TRANSACTIONS ══════════
-    if df.empty:
-        st.error("❌ Aucune transaction détectée. Vérifiez le format du PDF.")
+            ecart_class = "ecart-ok" if (delta is not None and delta < 0.05) else "ecart"
+            ecart_value = f"{delta:.2f} €" if delta is not None else "N/A"
+            ecart_note = ("Concordance OK ✓" if (delta is not None and delta < 0.05)
+                          else ("Vérifier" if delta is not None else "Clôture non détectée"))
+            st.markdown(
+                f"""
+                <div class="stat-wow-row">
+                    <div class="stat-wow credit">
+                        <div class="stat-wow-icon">📈</div>
+                        <div class="stat-wow-label">Total crédit</div>
+                        <div class="stat-wow-value credit">+{total_credit:,.2f} €</div>
+                        <div class="stat-wow-note">Flux entrants</div>
+                    </div>
+                    <div class="stat-wow debit">
+                        <div class="stat-wow-icon">📉</div>
+                        <div class="stat-wow-label">Total débit</div>
+                        <div class="stat-wow-value debit">−{abs(total_debit):,.2f} €</div>
+                        <div class="stat-wow-note">Décaissements</div>
+                    </div>
+                    <div class="stat-wow solde">
+                        <div class="stat-wow-icon">💼</div>
+                        <div class="stat-wow-label">Solde calculé</div>
+                        <div class="stat-wow-value solde">{solde_calcule:,.2f} €</div>
+                        <div class="stat-wow-note">Ouverture + mouvements</div>
+                    </div>
+                    <div class="stat-wow {ecart_class}">
+                        <div class="stat-wow-icon">{"✅" if (delta is not None and delta < 0.05) else "⚠️"}</div>
+                        <div class="stat-wow-label">Écart vs relevé</div>
+                        <div class="stat-wow-value {ecart_class}">{ecart_value}</div>
+                        <div class="stat-wow-note">{ecart_note}</div>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    with top_tabs[1]:
+        if df.empty:
+            st.error("❌ Aucune transaction détectée. Vérifiez le format du PDF.")
+        else:
+            st.markdown(
+                f"""
+                <div class="section-title">📊 Transactions — {len(df)} opérations</div>
+                <div class="section-subtitle">Tableau immersif pour parcourir rapidement l’ensemble des écritures.</div>
+                """,
+                unsafe_allow_html=True,
+            )
+            df_display = df.copy()
+            df_display["montant"] = pd.to_numeric(df_display["montant"], errors="coerce")
+            st.dataframe(
+                df_display,
+                use_container_width=True,
+                height=min(48 * len(df_display) + 58, 600),
+                column_config={
+                    "date": st.column_config.TextColumn("📅 Date", width="small"),
+                    "libelle": st.column_config.TextColumn("📝 Libellé", width="large"),
+                    "montant": st.column_config.NumberColumn(
+                        "💶 Montant (€)",
+                        format="%.2f",
+                        width="small",
+                    ),
+                },
+            )
+
+    with top_tabs[2]:
+        st.markdown(
+            """
+            <div class="section-title">⚙️ Paramètres export OFX</div>
+            <div class="section-subtitle">Finalisez les identifiants bancaires puis générez votre fichier OFX.</div>
+            """,
+            unsafe_allow_html=True,
+        )
+        ci, cb = st.columns(2, gap="large")
+        with ci:
+            iban_input = st.text_input("IBAN", value=iban or "")
+        with cb:
+            bic_input = st.text_input("BIC", value=bic or "")
+
+        if df.empty:
+            st.error("❌ Impossible de générer un OFX sans transaction.")
+        else:
+            if st.button("🚀 Générer le fichier OFX", type="primary", use_container_width=True):
+                ofx_content = generate_ofx(
+                    df,
+                    bank_id=bic_input or bic or "UNKNOWN",
+                    acc_id=iban_input or iban or "UNKNOWN",
+                    opening_balance=opening_balance,
+                )
+
+                ofx_filename = safe_name.replace(".pdf", ".ofx")
+
+                st.download_button(
+                    label="⬇️ Télécharger le fichier OFX",
+                    data=ofx_content.encode("utf-8"),
+                    file_name=ofx_filename,
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+
+                with st.expander("👁️ Aperçu OFX (80 premières lignes)"):
+                    st.code("\n".join(ofx_content.split("\n")[:80]), language="xml")
+
+                closing_final = opening_balance + df["montant"].sum()
+                st.success(
+                    f"✅ OFX généré — {len(df)} transactions | Clôture estimée : {closing_final:.2f} € | Fichier : `{ofx_filename}`"
+                )
+
+    with top_tabs[3]:
+        st.markdown(
+            """
+            <div class="section-title">🛠️ Outils de debug</div>
+            <div class="section-subtitle">Utiles pour contrôler le texte extrait quand un relevé est atypique.</div>
+            """,
+            unsafe_allow_html=True,
+        )
         if raw_text:
-            with st.expander("🔍 Texte brut extrait (debug)"):
-                st.text(raw_text[:3000])
-        return
+            with st.expander("🔍 Texte brut extrait"):
+                st.text(raw_text[:5000])
+        else:
+            st.info("Aucun texte brut disponible pour ce document.")
 
-    total_credit  = df[df["montant"] > 0]["montant"].sum()
-    total_debit   = df[df["montant"] < 0]["montant"].sum()
-    solde_calcule = opening_balance + total_credit + total_debit
-
-    st.subheader(f"📊 Transactions — {len(df)} opérations")
-
-    m1, m2, m3, m4 = st.columns(4)
-    m1.success(f"✅ **Total Crédit**\n\n**{total_credit:.2f} €**")
-    m2.error(f"🔻 **Total Débit**\n\n**{abs(total_debit):.2f} €**")
-    m3.info(f"📌 **Solde calculé**\n\n**{solde_calcule:.2f} €**")
-    if closing is not None:
-        delta = abs(solde_calcule - closing)
-        icon  = "✅" if delta < 0.05 else "⚠️"
-        msg   = f"{icon} **Écart vs relevé**\n\n**{delta:.2f} €**"
-        (m4.success if delta < 0.05 else m4.warning)(msg)
-
-    df_display = df.copy()
-    df_display["montant"] = df_display["montant"].apply(lambda x: f"{x:.2f}")
-    st.dataframe(df_display, use_container_width=True, height=420)
-
-    if ocr_used and raw_text:
-        with st.expander("🔍 Texte OCR brut (debug)"):
-            st.text(raw_text[:4000])
-
-    # ══════════ SECTION 4 : EXPORT OFX ══════════
-    st.subheader("⚙️ Paramètres export OFX")
-    ci, cb = st.columns(2)
-    with ci:
-        iban_input = st.text_input("IBAN", value=iban or "")
-    with cb:
-        bic_input = st.text_input("BIC", value=bic or "")
-
-    if st.button("🚀 Générer le fichier OFX", type="primary"):
-        ofx_content = generate_ofx(
-            df,
-            bank_id=bic_input or bic or "UNKNOWN",
-            acc_id=iban_input or iban or "UNKNOWN",
-            opening_balance=opening_balance,
-        )
-
-        ofx_filename = re.sub(r"\.(png|jpg|jpeg|tiff?|bmp|webp)$", ".ofx", safe_name, flags=re.IGNORECASE)
-        ofx_filename = ofx_filename.replace(".pdf", ".ofx")
-
-        st.download_button(
-            label="⬇️ Télécharger le fichier OFX",
-            data=ofx_content.encode("utf-8"),
-            file_name=ofx_filename,
-            mime="text/plain",
-        )
-
-        with st.expander("👁️ Aperçu OFX (80 premières lignes)"):
-            st.code("\n".join(ofx_content.split("\n")[:80]), language="xml")
-
-        closing_final = opening_balance + df["montant"].sum()
-        st.success(
-            f"✅ OFX généré — **{len(df)} transactions** | "
-            f"Clôture : **{closing_final:.2f} €** | "
-            f"Fichier : `{ofx_filename}`"
-        )
+    st.markdown(
+        """
+        <div class="footer-note">
+            OFX Converter Pro — conversion fiable, multi-banques France, export Odoo en un clic.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 if __name__ == "__main__":
