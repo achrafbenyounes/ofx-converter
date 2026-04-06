@@ -3475,11 +3475,21 @@ def inject_custom_ui() -> None:
             border-radius: 22px;
             padding: 0.6rem;
             box-shadow: var(--shadow);
-            animation: pulseGlow 7s ease-in-out infinite;
         }
 
         [data-testid="stFileUploader"] section {
             background: transparent;
+        }
+
+        /* ── Mobile : zone de drop entièrement tappable ── */
+        [data-testid="stFileUploaderDropzone"] {
+            min-height: 80px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            touch-action: manipulation;
+            -webkit-tap-highlight-color: transparent;
         }
 
         .stTabs [data-baseweb="tab-list"] {
@@ -3792,13 +3802,22 @@ def inject_custom_ui() -> None:
             font-weight: 800 !important;
             border: none !important;
             border-radius: 14px !important;
-            padding: 0.55rem 1.2rem !important;
+            padding: 0.65rem 1.4rem !important;
+            min-height: 44px !important;        /* WCAG touch target */
+            min-width: 120px !important;
             box-shadow: 0 8px 24px rgba(95,124,255,0.35) !important;
-            transition: transform .2s ease, box-shadow .2s ease !important;
+            touch-action: manipulation !important;
+            -webkit-tap-highlight-color: transparent !important;
+            cursor: pointer !important;
+            position: relative !important;
+            z-index: 2 !important;
         }
-        [data-testid="stFileUploader"] button:hover {
-            transform: translateY(-2px) scale(1.02) !important;
-            box-shadow: 0 14px 32px rgba(95,124,255,0.5) !important;
+        /* Hover uniquement sur non-touch pour éviter état collant sur mobile */
+        @media (hover: hover) {
+            [data-testid="stFileUploader"] button:hover {
+                transform: translateY(-2px) scale(1.02) !important;
+                box-shadow: 0 14px 32px rgba(95,124,255,0.5) !important;
+            }
         }
 
         /* ── File uploader drag label ── */
@@ -3878,9 +3897,124 @@ def inject_custom_ui() -> None:
         .stDataFrame iframe { border-radius: 16px !important; }
         [data-testid="stDataFrameResizable"] { border-radius: 16px !important; overflow: hidden; }
 
+        /* ============================================================
+           RESPONSIVE MOBILE (Android / iPhone)
+           ============================================================ */
+
+        /* Désactiver les animations lourdes sur mobile — évite le gel */
         @media (max-width: 768px) {
-            .stat-wow-row { grid-template-columns: repeat(2, 1fr); }
-            .stat-wow-value { font-size: 1.3rem; }
+            .stApp::before,
+            .stApp::after { display: none !important; }
+
+            .hero-shell::before { display: none !important; }
+
+            .hero-shell {
+                animation: fadeUp 0.5s ease !important;
+                border-radius: 18px !important;
+                padding: 1rem !important;
+            }
+
+            .main .block-container {
+                padding-left: 0.75rem !important;
+                padding-right: 0.75rem !important;
+                padding-top: 0.25rem !important;
+            }
+
+            /* Hero title plus petit */
+            .hero-title { font-size: 1.7rem !important; }
+            .hero-subtitle { font-size: 0.9rem !important; margin-bottom: 0.7rem !important; }
+
+            /* KPI grid : 2 colonnes sur mobile */
+            .hero-grid {
+                grid-template-columns: repeat(2, 1fr) !important;
+                gap: 0.6rem !important;
+            }
+
+            /* Stat wow : 2 colonnes */
+            .stat-wow-row {
+                grid-template-columns: repeat(2, 1fr) !important;
+                gap: 0.6rem !important;
+            }
+            .stat-wow-value { font-size: 1.2rem !important; }
+            .stat-wow-icon { font-size: 1.2rem !important; }
+
+            /* Tabs : scroll horizontal sur mobile */
+            .stTabs [data-baseweb="tab-list"] {
+                overflow-x: auto !important;
+                flex-wrap: nowrap !important;
+                gap: 0.3rem !important;
+                padding: 0.25rem !important;
+                -webkit-overflow-scrolling: touch;
+            }
+            .stTabs [data-baseweb="tab"] {
+                white-space: nowrap !important;
+                font-size: 0.82rem !important;
+                padding: 0.5rem 0.7rem !important;
+                min-height: 44px !important;
+            }
+
+            /* Uploader plus grand sur mobile */
+            [data-testid="stFileUploader"] {
+                border-radius: 16px !important;
+                padding: 0.4rem !important;
+            }
+            [data-testid="stFileUploaderDropzone"] {
+                min-height: 100px !important;
+                flex-direction: column !important;
+                gap: 0.5rem !important;
+            }
+            [data-testid="stFileUploader"] button {
+                width: 100% !important;
+                min-height: 52px !important;
+                font-size: 1rem !important;
+                border-radius: 12px !important;
+            }
+
+            /* Cards info : min-height plus petit */
+            .kpi-card { min-height: 90px !important; }
+            .info-panel { padding: 0.75rem !important; }
+
+            /* Enlever backdrop-filter coûteux sur mobile */
+            .hero-shell,
+            .kpi-card,
+            .glass-card,
+            .info-panel,
+            .sidebar-card,
+            .soft-badge,
+            .stat-wow {
+                backdrop-filter: none !important;
+                -webkit-backdrop-filter: none !important;
+            }
+
+            /* Upload CTA */
+            .upload-cta { font-size: 0.95rem !important; padding: 0.9rem 1rem !important; }
+
+            /* Boutons principaux */
+            .stButton > button,
+            .stDownloadButton > button {
+                min-height: 48px !important;
+                font-size: 0.95rem !important;
+            }
+
+            /* Footernote */
+            .footer-note { font-size: 0.78rem !important; }
+        }
+
+        /* Très petits écrans (< 480px) */
+        @media (max-width: 480px) {
+            .hero-grid { grid-template-columns: 1fr 1fr !important; }
+            .stat-wow-row { grid-template-columns: 1fr 1fr !important; }
+            .hero-title { font-size: 1.45rem !important; }
+            .badge-row { gap: 0.3rem !important; }
+            .soft-badge { font-size: 0.72rem !important; padding: 0.3rem 0.55rem !important; }
+        }
+
+        /* Réduire animations si l'utilisateur préfère */
+        @media (prefers-reduced-motion: reduce) {
+            *, *::before, *::after {
+                animation-duration: 0.01ms !important;
+                transition-duration: 0.01ms !important;
+            }
         }
         </style>
         """,
@@ -4076,7 +4210,7 @@ def main():
             """,
             unsafe_allow_html=True,
         )
-        i1, i2, i3 = st.columns(3, gap="large")
+        i1, i2, i3 = st.columns([1, 1.4, 0.7], gap="medium")
         with i1:
             render_info_card("Banque détectée", bank or "Non détectée", "🏦")
         with i2:
@@ -4093,7 +4227,7 @@ def main():
             unsafe_allow_html=True,
         )
 
-        col_o, col_c = st.columns([1.2, 1], gap="large")
+        col_o, col_c = st.columns([1.2, 1], gap="medium")
         with col_o:
             opening_balance = st.number_input(
                 "Solde d'ouverture (€)",
