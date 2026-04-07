@@ -3394,6 +3394,14 @@ def inject_custom_ui() -> None:
             height: 0 !important;
         }
 
+        /* Limiter le scroll horizontal sur html/body (pas sur .stApp) :
+           sur iOS Safari, overflow:hidden sur un ancêtre désactive les
+           événements touch des position:fixed enfants (blobs, uploader). */
+        html, body {
+            overflow-x: hidden;
+            max-width: 100vw;
+        }
+
         .stApp {
             background:
                 radial-gradient(circle at 10% 20%, rgba(83,224,194,0.18), transparent 22%),
@@ -3401,7 +3409,7 @@ def inject_custom_ui() -> None:
                 radial-gradient(circle at 80% 80%, rgba(255,138,91,0.12), transparent 24%),
                 linear-gradient(135deg, var(--bg-1) 0%, var(--bg-2) 45%, var(--bg-3) 100%);
             color: var(--text);
-            overflow-x: hidden;
+            /* overflow-x: hidden supprimé → corrige le bug touch iOS Safari */
         }
 
         .stApp::before,
@@ -3477,10 +3485,6 @@ def inject_custom_ui() -> None:
             box-shadow: var(--shadow);
         }
 
-        [data-testid="stFileUploader"] section {
-            background: transparent;
-        }
-
         /* ── Mobile : zone de drop entièrement tappable ── */
         [data-testid="stFileUploaderDropzone"] {
             min-height: 80px;
@@ -3490,6 +3494,23 @@ def inject_custom_ui() -> None:
             cursor: pointer;
             touch-action: manipulation;
             -webkit-tap-highlight-color: transparent;
+            /* Force les pointer-events sur la dropzone et tous ses enfants
+               (Streamlit peut les désactiver par défaut sur certaines versions) */
+            pointer-events: auto !important;
+            -webkit-user-select: none !important;
+            user-select: none !important;
+            position: relative;
+            z-index: 5;
+        }
+        [data-testid="stFileUploaderDropzone"] * {
+            pointer-events: auto !important;
+        }
+        /* Assure que la section interne ne capte pas les events à tort */
+        [data-testid="stFileUploader"] section {
+            background: transparent;
+            pointer-events: auto !important;
+            position: relative;
+            z-index: 5;
         }
 
         .stTabs [data-baseweb="tab-list"] {
@@ -3660,7 +3681,7 @@ def inject_custom_ui() -> None:
 
         .section-title {
             font-size: 1.08rem;
-            font-weight: 750;
+            font-weight: 700;
             color: white;
             margin: 0 0 0.85rem 0;
         }
@@ -3970,6 +3991,18 @@ def inject_custom_ui() -> None:
                 border-radius: 12px !important;
             }
 
+            /* ── Colonnes Streamlit : empilées verticalement sur mobile ── */
+            /* Évite les colonnes trop étroites (ex: IBAN sur 76px) */
+            [data-testid="stHorizontalBlock"] {
+                flex-direction: column !important;
+                gap: 0.5rem !important;
+            }
+            [data-testid="stColumn"] {
+                width: 100% !important;
+                flex: 1 1 100% !important;
+                min-width: 100% !important;
+            }
+
             /* Cards info : min-height plus petit */
             .kpi-card { min-height: 90px !important; }
             .info-panel { padding: 0.75rem !important; }
@@ -3981,7 +4014,16 @@ def inject_custom_ui() -> None:
             .info-panel,
             .sidebar-card,
             .soft-badge,
-            .stat-wow {
+            .stat-wow,
+            .upload-cta,
+            .stAlert,
+            [data-testid="stExpander"],
+            div[data-testid="stMetric"],
+            div[data-testid="stFileUploader"] > section,
+            div[data-testid="stTextInput"] > div,
+            div[data-testid="stNumberInput"] > div,
+            div[data-baseweb="select"] > div,
+            .stTabs [data-baseweb="tab-list"] {
                 backdrop-filter: none !important;
                 -webkit-backdrop-filter: none !important;
             }
@@ -4017,6 +4059,37 @@ def inject_custom_ui() -> None:
             }
         }
         </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Correctif JS : iOS Safari ignore accept=".pdf", nécessite application/pdf ──
+    # Streamlit génère <input accept=".pdf"> mais iOS Safari ouvre parfois un
+    # sélecteur vide. On enrichit l'attribut avec le MIME type explicite.
+    st.markdown(
+        """
+        <script>
+        (function() {
+            function patchFileInputs() {
+                var inputs = document.querySelectorAll('input[type="file"]');
+                inputs.forEach(function(inp) {
+                    if (!inp.dataset.patched) {
+                        inp.accept = '.pdf,application/pdf';
+                        inp.dataset.patched = '1';
+                        // S'assurer que le bouton Browse est cliquable sur mobile
+                        inp.style.setProperty('touch-action', 'manipulation', 'important');
+                    }
+                });
+            }
+            // Streamlit charge les widgets de façon asynchrone → on retente toutes les 400ms
+            var attempts = 0;
+            var iv = setInterval(function() {
+                patchFileInputs();
+                attempts++;
+                if (attempts >= 30) clearInterval(iv); // arrêt après 12s
+            }, 400);
+        })();
+        </script>
         """,
         unsafe_allow_html=True,
     )
@@ -4169,6 +4242,7 @@ def main():
     uploaded = st.file_uploader(
         "📁 Déposer le relevé bancaire (PDF)",
         type=["pdf"],
+        key="pdf_upload",
         help="Format accepté : PDF texte natif (relevé téléchargé depuis votre espace bancaire)",
     )
 
@@ -4187,8 +4261,16 @@ def main():
     if safe_name != uploaded.name:
         st.caption(f"📄 Fichier reçu : `{uploaded.name}` → normalisé en `{safe_name}`")
 
-    with st.spinner("🔍 Analyse du relevé en cours…"):
-        result = extract_all(uploaded)
+    try:
+        with st.spinner("🔍 Analyse du relevé en cours…"):
+            result = extract_all(uploaded)
+    except Exception as exc:
+        st.error(
+            f"❌ Erreur lors de l'analyse du PDF : {exc}\n\n"
+            "Vérifiez que le fichier est un **PDF texte natif** "
+            "(téléchargé depuis votre espace bancaire, non scanné)."
+        )
+        return
 
     bank = result["bank"]
     iban = result["iban"]
