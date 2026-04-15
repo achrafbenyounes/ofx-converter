@@ -279,7 +279,8 @@ _OPENING_PATTERNS = [
     #    pdfplumber colle CREDITEURAU sans espace — forme UNIQUE à BP Occitane.
     #    Doit être en PREMIER : la forme avec espaces matcherait sinon
     #    l'intermédiaire de fin de mois et non l'ouverture.
-    r"SOLDE\s*CREDITEUR(?:AU|\s+AU)\s*\d{2}/\d{2}/\d{4}\s*" + _AMT,
+    #    Tolérant aux accents : CRÉDITEUR ou CREDITEUR selon encodage PDF.
+    r"SOLDE\s*CR[EÉ]DITEUR(?:AU|\s+AU)\s*\d{2}/\d{2}/\d{4}\s*" + _AMT,
     # ── BNP Paribas : ligne "+ 3 351,28  Débit : 20 118,38  + 496,17"
     #    Le solde d'ouverture précède "Débit :" sur cette ligne ──
     r"([\+\-]?\s*\d[\d\s\xa0]*[,\.]\d{2})\s+D[ée]bit\s*:",
@@ -329,8 +330,9 @@ _CLOSING_PATTERNS = [
     # ── BNP pdfplumber (pas d'espaces) : "Soldecréditeurau31.12.2025 496,17" ──
     r"Soldecr[ée]diteurau\d{2}\.\d{2}\.\d{4}\s*" + _AMT,
     # ── Banque Populaire Occitane : "SOLDE CREDITEUR AU 05/03/2026* 67 491,10 €"
-    #    pdfplumber conserve l'astérisque réglementaire après la date ──
-    r"SOLDE\s*CREDITEUR(?:AU|\s*AU)\s*\d{2}/\d{2}/\d{4}\*?\s*" + _AMT,
+    #    pdfplumber conserve l'astérisque réglementaire après la date.
+    #    Tolérant aux accents : CRÉDITEUR ou CREDITEUR ──
+    r"SOLDE\s*CR[EÉ]DITEUR(?:AU|\s*AU)\s*\d{2}/\d{2}/\d{4}\*?\s*" + _AMT,
     # ── Société Générale : "NOUVEAU SOLDE AU 31/10/2025 + 3.014,95" (normal) ──
     r"NOUVEAU\s+SOLDE\s+AU\s+\d{2}/\d{2}/\d{4}\s*" + _AMT,
     # ── SG compact (pdfplumber) : "NOUVEAUSOLDEAU31/10/2025 +3.014,95" ──
@@ -377,9 +379,10 @@ def extract_closing_balance(text: str) -> float | None:
         r"[Ss]olde\s+au\s+\d{2}/\d{2}\s+" + _AMT,
         r"[Ss]olde\s+au\s+\d+\s+[A-ZÉÈÊA-Za-zéèêàâùûîô]{3,}\s*[:\n]?\s*" + _AMT,
         # CIC / Crédit Mutuel : "SOLDE CREDITEUR AU 02/02/2026 44.317,80"
-        r"SOLDE\s+CR[EÉ]DITEUR\s+AU\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,
+        # \*? : astérisque optionnel (Banque Populaire : "AU 02/04/2026* 72 201,74 €")
+        r"SOLDE\s+CR[EÉ]DITEUR\s+AU\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\*?\s*" + _AMT,
         # BNP Paribas : "Solde créditeur au 31.12.2025 496,17"
-        r"[Ss]olde\s+cr[ée]diteur\s+au\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,
+        r"[Ss]olde\s+cr[ée]diteur\s+au\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\*?\s*" + _AMT,
         # BNP pdfplumber (pas d'espaces) : "Soldecréditeurau31.12.2025 496,17"
         r"Soldecr[ée]diteurau\d{2}\.\d{2}\.\d{4}\s*" + _AMT,
         # ── Banque Populaire Occitane : toutes occurrences (joined + spaced + astérisque)
@@ -388,7 +391,7 @@ def extract_closing_balance(text: str) -> float | None:
         #    "SOLDE CREDITEUR AU 05/03/2026* 67 491,10 €" (clôture)
         #    → findall prend le DERNIER = solde de clôture
         #    ⚠ `\s*` après AU (pas \s+) car pdfplumber colle "AU" et la date dans la 1ère occurrence ──
-        r"SOLDE\s*CREDITEUR(?:AU|\s*AU)\s*\d{2}/\d{2}/\d{4}\*?\s*" + _AMT,
+        r"SOLDE\s*CR[EÉ]DITEUR(?:AU|\s*AU)\s*\d{2}/\d{2}/\d{4}\*?\s*" + _AMT,
     ]
     for pat in multi_patterns:
         matches = re.findall(pat, text, re.IGNORECASE | re.MULTILINE)
@@ -1066,7 +1069,7 @@ def parse_banque_populaire_text(text: str) -> pd.DataFrame:
     for pat in [
         r"RELEVE\s+N[°o]?\s*\d+\s+AU\s+\d{2}/\d{2}/(\d{4})",
         r"relev[ée]\s+de\s+compte\s+n[°o]?\d+\s+au\s+\d{2}/\d{2}/(\d{4})",
-        r"SOLDE\s+CREDITEUR(?:AU|\s+AU)\s+\d{2}/\d{2}/(\d{4})",
+        r"SOLDE\s+CR[ÉE]DITEUR(?:AU|\s+AU)\s+\d{2}/\d{2}/(\d{4})",
         r"\b(20\d{2})\b",
     ]:
         m = re.search(pat, text, re.IGNORECASE)
@@ -1075,13 +1078,23 @@ def parse_banque_populaire_text(text: str) -> pd.DataFrame:
             break
 
     # ── 2. Délimiter la zone utile ───────────────────────────────────────────
-    detail_m = re.search(r"DETAIL\s+DES\s+OPERATIONS", text, re.IGNORECASE)
-    if detail_m:
-        text = text[detail_m.start():]
+    # Chercher le début de la section transactions (tolérant aux accents)
+    for start_pat in [
+        r"D[ÉE]TAIL\s+DES\s+OP[ÉE]RATIONS",
+        r"D[ÉE]TAIL\s+DES\s+MOUVEMENTS",
+    ]:
+        detail_m = re.search(start_pat, text, re.IGNORECASE)
+        if detail_m:
+            text = text[detail_m.start():]
+            break
 
+    # Stopper avant la section SEPA (pages 13-17) qui re-liste les transactions
+    # → sans ce stop, les virements/prélèvements SEPA seraient comptés en double.
+    # Les patterns sont accent-tolérants (DÉBITEURS / DEBITEURS, DÉTAIL / DETAIL, etc.)
     for stop_pat in [
-        r"TOTAL\s+DES\s+MOUVEMENTS\s+DEBITEURS",
-        r"DETAIL\s+DE\s+VOS\s+(?:PRELEVEMENTS|VIREMENTS|MOUVEMENTS)\s+SEPA",
+        r"TOTAL\s+DES\s+MOUVEMENTS\s+D[ÉE]BITEURS",
+        r"D[ÉE]TAIL\s+DE\s+VOS\s+(?:PR[ÉE]L[ÈE]VEMENTS|VIREMENTS|MOUVEMENTS)\s+S[ÉE]?PA",
+        r"D[ÉE]TAIL\s+DE\s+VOS\s+OP[ÉE]RATIONS\s+SEPA",
     ]:
         sm = re.search(stop_pat, text, re.IGNORECASE)
         if sm:
@@ -1104,8 +1117,8 @@ def parse_banque_populaire_text(text: str) -> pd.DataFrame:
         r"|^DATE\s+DATE|^LIBELLE\s*/|^MONTANT$"
         # Lignes entête de colonnes fusionnées par pdfplumber (ex: "DATE DATE DATE LIBELLE")
         r"|^(?:DATE\s+){2,}|LIBELLE\s*/\s*REFERENCE"
-        r"|SOLDE\s+CREDITEUR"          # lignes de solde (pas des transactions)
-        r"|TOTAL\s+DES\s+MOUVEMENTS"   # résumé en pied
+        r"|SOLDE\s+CR[ÉE]DITEUR"         # lignes de solde (CREDITEUR ou CRÉDITEUR)
+        r"|TOTAL\s+DES\s+MOUVEMENTS"   # résumé en pied (débiteurs / créditeurs)
         r"|^VOTRE\s*COMPTE\s+COURANT"
         r"|^RELEVE\s+N[°o]"
         r"|^Page\s*\d|^page\s*\d|^Page\d"
@@ -1113,8 +1126,11 @@ def parse_banque_populaire_text(text: str) -> pd.DataFrame:
         r"|Banque\s+Populaire\s+Occitane"
         r"|textes\s+relatifs|Pompidou|ORIAS|RCS\s+TOULOUSE"
         r"|Méd[ié]ateure?|médiation|FNBP"
-        r"|DETAIL\s+DES\s+OPERATIONS"
+        r"|D[ÉE]TAIL\s+DES\s+OP[ÉE]RATIONS"
+        r"|D[ÉE]TAIL\s+DE\s+VOS\s+(?:MOUVEMENTS|VIREMENTS|PR[ÉE]L[ÈE]VEMENTS)\s+S[ÉE]?PA"
         r"|IBAN\s*:|BIC\s*:"
+        r"|R[ÉE]F[ÉE]RENCE\s+(?:MANDAT|CR[ÉE]ANCIER|REMETTANT)"
+        r"|DONNEUR\s+D.ORDRE|B[ÉE]N[ÉE]FICIAIRE\s*:"
         r"|SARL\s+PALAIS\s+ROYAL"
         r"|MESSAGE\s+DE\s+VOTRE\s+BANQUE"
         r"|Votre\s+Agence|VotreConseill|Votre\s+Conseill"
