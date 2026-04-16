@@ -167,6 +167,13 @@ def detect_bank(text: str) -> str:
     t = text.upper()
     if "BANQUE POSTALE" in t or "LABANQUEPOSTALE" in t:
         return "BANQUE_POSTALE"
+    # CIC détecté AVANT QONTO : les relevés CIC peuvent contenir "QONTO"
+    # comme libellé marchand (ex: "PAIEMENT CB … QONTO CARTE 7647") et
+    # déclenchaient un faux positif → parser Qonto appliqué → débit = 0.
+    # On utilise CREDIT INDUSTRIEL ET COMMERCIAL ou le BIC CMCIFRPP,
+    # deux identifiants exclusifs au CIC, jamais présents chez Qonto.
+    if re.search(r"CREDIT\s+INDUSTRIEL\s+ET\s+COMMERCIAL|CMCIFRPP", t):
+        return "CIC"
     if "QONTO" in t:
         return "QONTO"
     if "BNP PARIBAS" in t:
@@ -2854,7 +2861,7 @@ def parse_transactions_from_word_pages(
             if card_stop_y is not None:
                 page_words = [w for w in page_words if w["top"] < card_stop_y]
 
-        desc_end_x, debit_x, credit_x, boundary = _detect_columns(page_words)
+        desc_end_x, debit_x, credit_x, _ = _detect_columns(page_words)
         lines_by_y = _group_by_y(page_words, y_tol=y_tol)
 
         current_date: str | None = None
@@ -2927,8 +2934,14 @@ def parse_transactions_from_word_pages(
                 ):
                     continue
                 current_date = date_candidates[0]["text"]
-                current_debit = _extract_amount_from_zone(line_words, debit_x - 35, boundary)
-                current_credit = _extract_amount_from_zone(line_words, boundary, 650)
+                # Borne de séparation débit/crédit : x0 du header "Crédit" (bord gauche
+                # de la colonne crédit). Plus robuste que le milieu (debit_x1+credit_x)/2
+                # pour les banques (CIC, etc.) qui alignent les montants à DROITE dans
+                # la colonne débit : ces montants ont un x0 > boundary mais < credit_x,
+                # donc tombaient dans les deux zones avec l'ancienne formule →
+                # résolution erronée « Crédit » par le tiebreaker.
+                current_debit = _extract_amount_from_zone(line_words, debit_x - 35, credit_x)
+                current_credit = _extract_amount_from_zone(line_words, credit_x, 650)
                 # Exclure les mots qui ressemblent à une date et se trouvent dans la zone
                 # des colonnes Date / Date valeur (x0 < 130) — évite la 2e date CIC/CM
                 _DATE_RE = re.compile(r"^\d{2}[/\.]\d{2}([/\.]\d{2,4})?$")
@@ -2952,8 +2965,8 @@ def parse_transactions_from_word_pages(
                 # On ne cherche que si aucun montant n'a encore été trouvé sur la
                 # ligne de date, pour ne pas écraser un montant déjà détecté. ──
                 if current_debit is None and current_credit is None:
-                    cont_debit  = _extract_amount_from_zone(line_words, debit_x - 35, boundary)
-                    cont_credit = _extract_amount_from_zone(line_words, boundary, 650)
+                    cont_debit  = _extract_amount_from_zone(line_words, debit_x - 35, credit_x)
+                    cont_credit = _extract_amount_from_zone(line_words, credit_x, 650)
                     if cont_debit is not None:
                         current_debit = cont_debit
                     elif cont_credit is not None:
