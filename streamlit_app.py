@@ -191,7 +191,16 @@ def detect_bank(text: str) -> str:
         return "CREDIT_MUTUEL"
     if re.search(r"\bCIC\b", t) and ("BANQUE" in t or "INDUSTRIEL" in t or "RELEVE" in t or "RELEVÉ" in t):
         return "CIC"
-    if re.search(r"\bLCL\b", t) and ("BANQUE" in t or "RELEVÉ" in t or "RELEVE" in t or "LYONNAIS" in t):
+    # LCL : logo "LCL" est souvent une image dans le PDF → non extrait par pdfplumber.
+    # Identifiants textuels fiables : "CREDIT LYONNAIS" (sans accent), "CRÉDIT LYONNAIS"
+    # (avec accent — pdfplumber uppercased → "CRÉDIT"), ou le BIC exclusif "CRLYFRPP".
+    # CR[EÉ]DIT gère les deux formes ; [\s-]* gère fusion/tiret/espace ; "LYONNAIS"
+    # seul (ASCII, pas d'accent) est aussi testé en fallback.
+    if (
+        (re.search(r"\bLCL\b", t) and ("BANQUE" in t or "RELEVÉ" in t or "RELEVE" in t or "LYONNAIS" in t))
+        or re.search(r"CR[EÉ]DIT[\s-]*LYONNAIS|CRLYFRPP", t)
+        or ("LYONNAIS" in t and ("RELEVE" in t or "RELEVÉ" in t or "ECRITURES" in t or "COMPTE" in t))
+    ):
         return "LCL"
     if "CAISSE D'EPARGNE" in t or "CAISSE EPARGNE" in t or "CAISSEEPARGNE" in t or "CAISSE D" in t and "PARGNE" in t:
         return "CAISSE_EPARGNE"
@@ -353,10 +362,12 @@ _CLOSING_PATTERNS = [
     r"SOLDE\s+FINAL\s+" + _AMT,
     r"SOLDE\s+EN\s+FIN\s+DE\s+P[EÉ]RIODE\s+" + _AMT,
     r"[Cc]losing\s+[Bb]alance\s*:?\s*€?\s*" + _AMT,
-    # ── LCL : "SOLDE EN EUROS 1 807,68" (solde final de clôture) ──
-    r"SOLDE\s+EN\s+EUROS\s+" + _AMT,
+    # ── LCL : "SOLDE EN EUROS 1 807,68" ou "SOLDE EN EUROS . 55,25"
+    #    Le "." est le séparateur de colonne vide (colonne Débit) dans le texte pdfplumber LCL.
+    #    [\s.]* absorbe 0-N espaces/points entre "EUROS" et le montant. ──
+    r"SOLDE\s+EN\s+EUROS[\s.]*" + _AMT,
     # ── LCL : "SOLDE INTERMEDIAIRE A FIN DECEMBRE 387,68" (solde intermédiaire) ──
-    r"SOLDE\s+INTERMEDIAIRE\s+A\s+FIN\s+\w+\s+" + _AMT,
+    r"SOLDE\s+INTERMEDIAIRE\s+A\s+FIN\s+\w+[\s.]*" + _AMT,
     # ── Finom : "Solde de clôture : 542,59 €" ──
     r"[Ss]olde\s+de\s+cl[ôo]ture\s*:?\s*" + _AMT,
 ]
