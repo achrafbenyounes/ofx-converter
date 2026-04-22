@@ -1851,7 +1851,9 @@ def parse_credit_agricole_text(text: str, year: str | None = None) -> pd.DataFra
         # Remise chèque
         r"|^Rem(?:ise)?\s+Chq\b"
         # Virements entrants connus : Uber Eats, Swile, Edenred, Up Coop, Quatra remboursement
-        r"|^Virement\s+(?:Stichting|Edenred|Up\s+Coop|Quatra)\b",
+        r"|^Virement\s+(?:Stichting|Edenred|Up\s+Coop|Quatra)\b"
+        # Virement Resto Proxi : agrégateur carte (Revt Cb / reversement encaissements CB)
+        r"|^Virement\s+Resto\s+Proxi\b",
         re.IGNORECASE,
     )
 
@@ -1941,6 +1943,11 @@ def parse_credit_agricole_text(text: str, year: str | None = None) -> pd.DataFra
         ):
             return 1
 
+        # Agregateur carte (Resto Proxi, etc.) : reversement encaissements CB
+        # "Reverst Cb" = reversement cartes bancaires (crédit vers le compte CA)
+        if re.search(r"\bResto\s+Proxi\b|\bReverst\s+Cb\b", d, re.IGNORECASE):
+            return 1
+
         # Tout autre Virement sans indicateur = débit (conservateur)
         # Rationale : les virements entrants connus sont listés ci-dessus ;
         # un virement non reconnu est plus probablement un paiement sortant.
@@ -2019,6 +2026,59 @@ def parse_credit_agricole_text(text: str, year: str | None = None) -> pd.DataFra
     df = pd.DataFrame(transactions)
     df["montant"] = df["montant"].round(2)
     return df
+
+
+def parse_ca_carte_business_text(text: str, year: str | None = None) -> pd.DataFrame:
+    """
+    Crédit Agricole — Relevé Carte Business (carte à débit différé).
+
+    Format pdfplumber : DD.MM  COMMERCE  LIEU_D_ACHAT  MONTANT_EN_EUR
+    Une seule colonne de date (pas de date valeur), toutes les opérations sont DÉBIT.
+    Pas de solde d'ouverture/clôture (relevé de carte, pas de compte bancaire).
+
+    Exemples de lignes :
+      "30.01 PROMOCASH VENDOME 42,86"
+      "10.02 FEU VERT VENDOME VENDOME 322,02"
+      "09.02 Action 4278 Vend?me Saint 126,10"
+    """
+    # Année depuis "au DD.MM.YYYY" dans l'en-tête
+    if year is None:
+        m = re.search(r"\bau\s+\d{2}\.\d{2}\.(\d{4})", text, re.IGNORECASE)
+        if m:
+            year = m.group(1)
+        else:
+            m2 = re.search(r"(20\d{2})", text)
+            year = m2.group(1) if m2 else str(datetime.now().year)
+
+    # Tronquer avant les lignes de totaux
+    sm = re.search(r"TOTAL\s+DES\s+OP[EÉ]RATIONS", text, re.IGNORECASE)
+    if sm:
+        text = text[:sm.start()]
+
+    # Ligne transaction : DD.MM suivi de la description puis du montant (dernier token)
+    # Le montant peut avoir un séparateur milliers espace : "1 276,04"
+    _TX = re.compile(
+        r"^(\d{2}\.\d{2})\s+(.+?)\s+(\d{1,3}(?:[\s\xa0]\d{3})*,\d{2})\s*$",
+        re.MULTILINE,
+    )
+
+    transactions = []
+    for m in _TX.finditer(text):
+        dm = m.group(1)
+        libelle = re.sub(r"\s{2,}", " ", m.group(2)).strip()
+        amount = clean_amount(m.group(3))
+        if amount is None or amount == 0:
+            continue
+        date_str = f"{dm[:2]}/{dm[3:]}/{year}"
+        transactions.append({
+            "date": date_str,
+            "libelle": libelle,
+            "montant": round(-abs(amount), 2),
+        })
+
+    if not transactions:
+        return pd.DataFrame(columns=["date", "libelle", "montant"])
+    return pd.DataFrame(transactions)
 
 
 def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFrame:
@@ -3275,11 +3335,16 @@ def extract_all(pdf_file) -> dict:
             df = parse_transactions_text(raw_text, year=year_ref)
 
     elif bank == "CREDIT_AGRICOLE":
-        df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
-        if df.empty:
-            df = parse_credit_agricole_text(raw_text, year_ref)
-        if df.empty:
-            df = parse_transactions_text(raw_text, year=year_ref)
+        # Relevé Carte Business (format DD.MM COMMERCE LIEU MONTANT, tout débit)
+        # → parser dédié ; les parseurs standard ne gèrent pas ce format.
+        if re.search(r"Relev[ée]\s+Carte\s+Business", raw_text, re.IGNORECASE):
+            df = parse_ca_carte_business_text(raw_text, year_ref)
+        else:
+            df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
+            if df.empty:
+                df = parse_credit_agricole_text(raw_text, year_ref)
+            if df.empty:
+                df = parse_transactions_text(raw_text, year=year_ref)
 
     elif bank == "CREDIT_MUTUEL":
         df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
