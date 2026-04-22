@@ -3340,9 +3340,14 @@ def extract_all(pdf_file) -> dict:
         if re.search(r"Relev[ée]\s+Carte\s+Business", raw_text, re.IGNORECASE):
             df = parse_ca_carte_business_text(raw_text, year_ref)
         else:
-            df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
+            # Parser texte CA en priorité : il gère la détermination débit/crédit par
+            # mots-clés (Remise Carte, Virement entrant, Resto Proxi…) et est plus
+            # fiable que le parser colonne générique qui peut manquer des crédits
+            # lorsque les positions x0 des colonnes CA ne correspondent pas aux valeurs
+            # par défaut (→ écart de montant en fin de relevé).
+            df = parse_credit_agricole_text(raw_text, year_ref)
             if df.empty:
-                df = parse_credit_agricole_text(raw_text, year_ref)
+                df = parse_transactions_by_column(io.BytesIO(pdf_bytes))
             if df.empty:
                 df = parse_transactions_text(raw_text, year=year_ref)
 
