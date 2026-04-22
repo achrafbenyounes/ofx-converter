@@ -400,6 +400,24 @@ def extract_opening_balance(text: str) -> float | None:
 
 
 def extract_closing_balance(text: str) -> float | None:
+    # ── BNP Paribas : solde débiteur (compte en déficit) ──────────────────────
+    # pdfplumber compacte la ligne finale de page 9 en :
+    #   "Soldedébiteurau28.02.2026 1175,85"  (pas d'espaces, pas de signe)
+    # La valeur est POSITIVE dans le PDF mais représente un SOLDE NÉGATIF.
+    # Ce pattern doit être vérifié EN PREMIER pour éviter que les patterns
+    # génériques ne remontent le solde d'OUVERTURE à la place (voir bug :
+    # "Solde au 28 FÉVRIER :\n+ 7 731,37" matchait avant "- 1 175,85").
+    # Deux variantes : compact pdfplumber ET version espacée (robustesse).
+    for _deb_pat in [
+        r"Solded[ée]biteurau\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,           # compact pdfplumber
+        r"[Ss]olde\s+d[ée]biteur\s+au\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,  # espacé
+    ]:
+        m_deb = re.search(_deb_pat, text, re.IGNORECASE | re.MULTILINE)
+        if m_deb:
+            val = clean_amount(m_deb.group(1))
+            if val is not None:
+                return -abs(val)  # solde débiteur = solde négatif
+
     # Qonto / BNP : findall → prendre le DERNIER match
     multi_patterns = [
         r"[Ss]olde\s+au\s+\d{2}/\d{2}\s+" + _AMT,
@@ -1840,6 +1858,10 @@ def parse_credit_agricole_text(text: str, year: str | None = None) -> pd.DataFra
         r"|Rue\s+[A-Z]"
         r"|COMPIEGNE|AMIENS|CEDEX"
         r"|^\d{9,}\s*$"
+        r"|^\d{4,8}\s*$"              # numéros de marge CA (ex : 011833, 0001, 033062…)
+        r"|VAL\s+DE\s+FRANCE"         # sous-titre banque sur sa propre ligne
+        r"|^op[eé]\.\s*valeur\s*$"    # en-tête colonne résiduel après saut de page
+        r"|Date\s+valeur"             # variante de l'en-tête colonne
         r"|Appel\s+non\s+surtax",
         re.IGNORECASE,
     )
@@ -2001,7 +2023,14 @@ def parse_credit_agricole_text(text: str, year: str | None = None) -> pd.DataFra
         if not line or _SKIP.search(line):
             continue
 
-        m_tx = _TX_START.match(line)
+        # ── Quirk pdfplumber CA : le symbole ¨ de la ligne précédente et la date
+        # de la transaction suivante sont parfois collés sur la même ligne :
+        #   "¨ 23.03 23.03 Remise Carte 1111132 003 087698 23/03 172,30"
+        # → on nettoie le préfixe ¨/□ avant de tester _TX_START, puis on utilise
+        #   la ligne nettoyée comme première ligne du nouveau bloc.
+        line_clean = re.sub(r'^[¨□]+\s*', '', line)
+
+        m_tx = _TX_START.match(line_clean)
         if m_tx:
             # Flush bloc précédent
             if block and block_date:
@@ -2009,7 +2038,7 @@ def parse_credit_agricole_text(text: str, year: str | None = None) -> pd.DataFra
                 if tx:
                     transactions.append(tx)
             block_date = m_tx.group(1)   # DD.MM
-            block = [line]
+            block = [line_clean]         # bloc sans le préfixe ¨ parasite
         elif block_date:
             # Ligne de continuation (description multi-lignes)
             block.append(line)
