@@ -191,6 +191,13 @@ def detect_bank(text: str) -> str:
         return "BNP_PARIBAS"
     if "CREDIT AGRICOLE" in t or "CRÉDIT AGRICOLE" in t:
         return "CREDIT_AGRICOLE"
+    # SHINE détecté AVANT Société Générale : les relevés Shine contiennent fréquemment
+    # "LA SOCIETE GENERALE" comme libellé marchand (paiements carte vers SG),
+    # ce qui déclenchait un faux positif SG. Les marqueurs Shine ci-dessous
+    # (BIC SNNNFR, domaine shine.fr, raison sociale Shine France) sont
+    # exclusifs aux en-têtes/pieds Shine et n'apparaissent jamais dans un vrai relevé SG.
+    if "SHINE" in t and ("SHINE.FR" in t or "SHINE FRANCE" in t or "SNNNFR" in t):
+        return "SHINE"
     # SG : pdfplumber fusionne les mots → "SociétéGénérale" ou "SOCIETEGENERALE"
     if ("SOCIETE GENERALE" in t or "SOCIÉTÉ GÉNÉRALE" in t
             or "SOCIETEGENERALE" in t or "SOCIÉTÉGÉNÉRALE" in t
@@ -221,8 +228,6 @@ def detect_bank(text: str) -> str:
         return "BOURSORAMA"
     if "REVOLUT" in t:
         return "REVOLUT"
-    if "SHINE" in t and ("SHINE.FR" in t or "SHINE FRANCE" in t or "SNNNFR" in t):
-        return "SHINE"
     if "HELLO BANK" in t:
         return "HELLO_BANK"
     if "FORTUNEO" in t:
