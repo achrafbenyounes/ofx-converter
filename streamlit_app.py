@@ -167,12 +167,23 @@ def detect_bank(text: str) -> str:
     t = text.upper()
     if "BANQUE POSTALE" in t or "LABANQUEPOSTALE" in t:
         return "BANQUE_POSTALE"
+    # Finom AVANT CIC : les relevés Finom contiennent des BIC tiers "CMCIFRPPXXX"
+    # (Crédit Industriel et Commercial) dans les virements sortants/entrants.
+    # CMCIFRPP étant un sous-pattern de CMCIFRPPXXX, la détection CIC (ci-dessous)
+    # se déclenchait par erreur. FNOMFRP2 / PNL FINTECH / FINOM.CO / FINOM PAYMENTS
+    # sont exclusifs aux en-têtes et pieds de page des relevés Finom.
+    if (
+        "FNOMFRP2" in t
+        or "PNL FINTECH" in t
+        or re.search(r"FINOM\.CO|FINOM\s+PAYMENTS", t)
+    ):
+        return "FINOM"
     # CIC détecté AVANT QONTO : les relevés CIC peuvent contenir "QONTO"
     # comme libellé marchand (ex: "PAIEMENT CB … QONTO CARTE 7647") et
     # déclenchaient un faux positif → parser Qonto appliqué → débit = 0.
-    # On utilise CREDIT INDUSTRIEL ET COMMERCIAL ou le BIC CMCIFRPP,
-    # deux identifiants exclusifs au CIC, jamais présents chez Qonto.
-    if re.search(r"CREDIT\s+INDUSTRIEL\s+ET\s+COMMERCIAL|CMCIFRPP", t):
+    # \bCMCIFRPP\b (frontière de mot) évite de matcher CMCIFRPPXXX (BIC avec
+    # suffixe de branche XXX) qui peut apparaître dans des relevés tiers.
+    if re.search(r"CREDIT\s+INDUSTRIEL\s+ET\s+COMMERCIAL|\bCMCIFRPP\b", t):
         return "CIC"
     if "QONTO" in t:
         return "QONTO"
@@ -222,13 +233,10 @@ def detect_bank(text: str) -> str:
         return "N26"
     if "SUMERIA" in t or "LYDIA" in t:
         return "SUMERIA"
-    # Finom : BIC propriétaire FNOMFRP2 ou mention "Finom" / "PNL Fintech"
-    if (
-        "FNOMFRP2" in t
-        or "FINOM" in t
-        or "PNL FINTECH" in t
-        or re.search(r"FINOM\.CO|FINOM\s+PAYMENTS", t)
-    ):
+    # Finom : fallback sur le mot "FINOM" seul (watermark "Créé avec Finom.co",
+    # logo "finom") — placé après toutes les banques françaises pour éviter les
+    # faux positifs si "FINOM" apparaît comme libellé marchand dans un autre relevé.
+    if "FINOM" in t:
         return "FINOM"
     return "GENERIC"
 
