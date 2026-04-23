@@ -1722,10 +1722,21 @@ def parse_bnp_paribas_text(text: str, year: str | None = None) -> pd.DataFrame:
         nonlocal cur_date, cur_desc, cur_amt
         if cur_date is not None and cur_amt is not None:
             lib = re.sub(r"\s{2,}", " ", " ".join(cur_desc)).strip()[:120]
+            # ── Cas BNP : "PRLV SEPA RETOURNÉ / RETOURNE" ──────────────────────
+            # Un prélèvement rejeté (motif AM04 / fonds insuffisants) est renvoyé
+            # au créditeur : la banque CRÉDITE le compte du titulaire.
+            # Ces lignes apparaissent physiquement dans la section
+            # "PRELEVEMENTS, AMORTISSEMENTS DE PRETS" (sign=-1), mais leur
+            # montant figure dans la colonne CRÉDIT du relevé PDF.
+            # → Quand le libellé contient "RETOURNE" et que la section courante
+            #   est débit, on force le signe à +1 (crédit).
+            effective_sign = sign
+            if sign == -1 and re.search(r"RETOURNÉ?E?", lib, re.IGNORECASE):
+                effective_sign = +1
             transactions.append({
                 "date": cur_date,
                 "libelle": lib,
-                "montant": round(sign * cur_amt, 2),
+                "montant": round(effective_sign * cur_amt, 2),
             })
         cur_date = None
         cur_desc = []
