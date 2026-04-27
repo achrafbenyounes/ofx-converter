@@ -2132,8 +2132,9 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
 
     Spécificités SG :
       • Format date : DD/MM/YYYY DD/MM/YYYY (date comptable + date valeur)
-      • Montant sur la DERNIÈRE ligne du bloc (pas toujours sur la ligne de date)
-        Ex : VIR RECU sur 4 lignes → montant isolé en dernier
+      • Montant possible :
+          - sur la 1ère ligne (format compact : REMISE CB, VIR INSTANTANE EMIS, ...)
+          - OU sur la dernière ligne du bloc (anciens formats : VIR RECU sur 4 lignes...)
       • Deux colonnes Débit/Crédit sans signe → signe déduit par mots-clés
       • Montants avec séparateur milliers point français : "1.426,32"
       • pdfplumber fusionne les mots (pas d'espace) : "VIRINSTRE" = "VIR INST RE"
@@ -2145,6 +2146,11 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
         pdfplumber fusionne en "VIRINSTANTANEEMISNET"
       • VIR EUROPEEN EMIS NET   → Virement SEPA Émis            → DÉBIT  (-)
       • VIR PERM                → Virement Permanent            → DÉBIT  (-)
+
+    Saisies administratives à tiers détenteur (SATD) :
+      • BLOCAGE PROVISION       → blocage par l'administration  → DÉBIT  (-)
+      • DEBLOCAGE PROVISION     → mainlevée totale (les fonds
+                                  reviennent sur le compte)     → CRÉDIT (+)
 
     Stratégie :
       1. Grouper les lignes en blocs (nouveau bloc = ligne commençant par DD/MM/YYYY)
@@ -2168,31 +2174,39 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
     # NOTE : pdfplumber fusionne parfois les mots (espaces supprimés) → \s* dans les patterns.
     # Le timbre ADEME en marge droite produit des lignes parasites : BGSY10_…, ":", "EMEDA", "°N".
     _SKIP = re.compile(
-        r"^(Date\s+Valeur|Nature\s+de\s+l|RELEVÉ\s*DES|suite\s*>>>|Page\s+\d"
+        r"^(Date\s+Valeur|Nature\s+de\s+l|RELEVÉ\s*DES|suite\s*>>>|Page\s*\d"
         r"|N°\s*ADEME|Société\s*Générale|SociétéGénérale"
         r"|S\.A\.\s*au\s*capital|SiègeSocial|Siège\s+Social"
-        r"|29[,\s]+bd\s+Haussmann|RA\d{4,}|SOLDE\s*PR[EÉ]C[EÉ]DENT"
+        r"|29[,\s]*bd\s*Haussmann"             # \s* car pdfplumber peut fusionner: "29,bdHaussmann75009Paris"
+        r"|RA\d{4,}|SOLDE\s*PR[EÉ]C[EÉ]DENT"
         r"|RELEVÉ\s*DE\s*COMPTE|CTC\s*INDEXE|VOS\s*CONTACTS|Pour\s+toute"
         r"|Votre\s+[Bb]anque|Votre\s+agence|Votre\s+conseiller"
         r"|\*\s*Op[eé]ration\s+exon|552\s*120\s*222|RCS\s+Paris"
         r"|1\s*Depuis\s*l..[eé]tranger|Depuis\s*l..[eé]tranger"
-        r"|BGSY\d"                             # timbre ADEME (ex: BGSY10_527132RF)
-        r"|^:\s*$"                             # ligne avec seulement ":"
-        r"|^°N\s*$"                            # fragment "°N" du timbre N° ADEME
-        r"|^:?\s*EMEDA\s*$"                    # "EMEDA" ou ": EMEDA" (pages 2-3, timbre ADEME)
-        r"|\d{6}AR\s*$"                        # code marge pages 2-3 ex: "720624AR"
-        r"|PROGRAMME\s*DE\s*FID[EÉ]LIT[EÉ]"  # pied de page fidélité
+        r"|BGSY\d"                              # timbre ADEME (ex: BGSY10_527132RF)
+        r"|^:\s*$"                              # ligne avec seulement ":"
+        r"|^°N\s*$"                             # fragment "°N" du timbre N° ADEME
+        r"|^:?\s*EMEDA\s*$"                     # "EMEDA" ou ": EMEDA" (pages 2+, timbre ADEME)
+        r"|\d{6}AR\s*$"                         # code marge pages internes ex: "720624AR"
+        # ── Artefacts d'en-tête répétés à chaque page (le compte, la période, le n° d'envoi)
+        r"|COMPTE\s*D.ENTREPRISE"               # "COMPTE D'ENTREPRISE - eneuros"
+        r"|n°\s*\d{5}\s*\d"                     # "n°30003016600002001610595" (n° de compte)
+        r"|du\s*\d{2}/\d{2}/\d{4}\s*au\s*\d{2}/\d{2}/\d{4}"  # période "du DD/MM/YYYY au DD/MM/YYYY"
+        r"|envoi\s*n°"                          # "envoin°2 Page4/11"
+        # ── Pieds de page divers ────────────────────────────────────────────────
+        r"|PROGRAMME\s*DE\s*FID[EÉ]LIT[EÉ]"
         r"|Montant\s*cumul[eé]\s*des\s*d[eé]penses"
         r"|Rappel\s*des\s*seuils\s*de\s*d[eé]clenchement"
         r"|euros\s+d[eé]pens[eé]s\s+sur\s+une\s+p[eé]riode"
         r"|pour\s+une\s+r[eé]duction\s+de\s+\d+%"
-        r"|INFO\s*CHEQUIER"                    # notice chéquier
+        r"|INFO\s*CHEQUIER"                     # notice chéquier
         r"|dans\s+votre\s+agence\s+\w)",
         re.IGNORECASE,
     )
 
     # Indicateurs de CRÉDIT (montant positif)
-    # Couvre : remises CB, virements reçus, versements espèces, remises chèques…
+    # Couvre : remises CB, virements reçus, versements espèces, remises chèques,
+    # mainlevées de saisie administrative, remboursements...
     # NOTE: \s* partout car pdfplumber fusionne les mots sans espace.
     _CREDIT_RE = re.compile(
         r"REMISE\s*CB"                        # REMISE CB / REMISECB — encaissement TPE
@@ -2204,6 +2218,10 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
         r"|REMBOURSEMENT\s*PRLV"
         r"|CARTE.{0,25}REMBT"
         r"|CART.{0,10}REMB"
+        # ── Mainlevée de saisie administrative à tiers détenteur ──────────────
+        r"|DEBLOCAGE\s*PROVISION"             # DEBLOCAGE PROVISION SUR SAISIE ATD = mainlevée totale
+                                              #   pdfplumber fusionne → "DEBLOCAGEPROVISIONSUR"
+                                              #   ⚠ "BLOCAGE" (sans DE) reste débit (default fallback)
         # ── Versements espèces / chèques ──────────────────────────────────────
         r"|VRST\s*GAB"                        # Versement espèces via GAB (distributeur)
                                               # Ex : "VRST GAB 13/01/26 16H44 003800"
@@ -2276,7 +2294,13 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
            CHEQUE\\b dans _DEBIT_RE génère une fausse ambiguïté -> on court-circuite.
            Ex : "REMISE CHEQUE 0000225 015" ou "REMISECHEQUE..." (pdfplumber fusionne).
 
-        2. INT DEBITEURS : CRÉDIT ou DÉBIT selon les sous-montants.
+        2. DEBLOCAGE PROVISION : toujours CRÉDIT (mainlevée d'une saisie ATD,
+           la banque rend les fonds bloqués). Court-circuit pour éviter le piège
+           de la sous-chaîne "BLOCAGE" qui pourrait matcher un éventuel pattern
+           débit "BLOCAGE PROVISION" et créer une ambiguïté → débit par défaut.
+           Ex : "DEBLOCAGE PROVISION SUR SAISIE ATD ... 332,00 ... MAIN-LEVEE TOTALE"
+
+        3. INT DEBITEURS : CRÉDIT ou DÉBIT selon les sous-montants.
            Si les lignes de détail contiennent des montants négatifs ("-0,44" ...)
            c'est un avoir -> CRÉDIT. Sinon (montants positifs, ex "0,27") -> DÉBIT.
         """
@@ -2284,7 +2308,11 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
         if re.search(r"REMISE\s*CH[EÈ]QUE", full_text, re.IGNORECASE):
             return 1
 
-        # ── Règle 2 : INT DEBITEURS -> détecter crédit vs débit via les détails ──
+        # ── Règle 2 : DEBLOCAGE PROVISION -> toujours crédit ────────────────────
+        if re.search(r"DEBLOCAGE\s*PROVISION", full_text, re.IGNORECASE):
+            return 1
+
+        # ── Règle 3 : INT DEBITEURS -> détecter crédit vs débit via les détails ──
         if re.search(r"INT\s*D[EÉ]BITEURS", full_text, re.IGNORECASE):
             if re.search(r"-\s*\d+[,\.]\d{2}", full_text):
                 return 1   # montants négatifs dans les détails -> remboursement -> crédit
@@ -2297,13 +2325,14 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
         if is_debit and not is_credit:
             return -1
         # Ambiguïté ou non reconnu -> débit par défaut (plus sûr comptablement)
+        # Note : "BLOCAGE PROVISION" (sans DE) tombe ici → débit ✓
         return -1
 
     def _extract_amount(blines: list[str]) -> float | None:
         """
         Cherche le montant dans le bloc :
-          1. Dernière ligne autonome (_AMT_LINE)
-          2. Montant en fin de la première ligne (_AMT_INLINE) — transactions simples
+          1. Dernière ligne autonome (_AMT_LINE) — anciens formats SG
+          2. Montant en fin de la première ligne (_AMT_INLINE) — formats récents
           3. Tout dernier token numérique \\d+,\\d{2} dans le bloc
         """
         # 1. Ligne autonome (chercher en remontant depuis la fin)
@@ -2371,12 +2400,6 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
             flush_block()
             block_date  = date_m.group(1)
             block_lines = [line]
-            # Flush immédiat si montant déjà sur la ligne de date (transaction simple)
-            if _AMT_INLINE.search(
-                re.sub(r"^\d{2}/\d{2}/\d{4}\s*(?:\d{2}/\d{2}/\d{4})?\s*", "", line)
-            ):
-                # On laisse le bloc ouvert : il sera flush au prochain bloc ou en fin de boucle
-                pass
         elif block_date is not None:
             # Vérifier si c'est un montant autonome (dernière ligne du bloc SG)
             if _AMT_LINE.match(line):
