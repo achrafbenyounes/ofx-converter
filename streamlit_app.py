@@ -178,11 +178,32 @@ def detect_bank(text: str) -> str:
         or re.search(r"FINOM\.CO|FINOM\s+PAYMENTS", t)
     ):
         return "FINOM"
+    # SHINE détecté AVANT Société Générale : les relevés Shine contiennent fréquemment
+    # "LA SOCIETE GENERALE" comme libellé marchand (paiements carte vers SG),
+    # ce qui déclenchait un faux positif SG. Les marqueurs Shine ci-dessous
+    # (BIC SNNNFR, domaine shine.fr, raison sociale Shine France) sont
+    # exclusifs aux en-têtes/pieds Shine et n'apparaissent jamais dans un vrai relevé SG.
+    if "SHINE" in t and ("SHINE.FR" in t or "SHINE FRANCE" in t or "SNNNFR" in t):
+        return "SHINE"
+    # SG détecté AVANT CIC : les relevés SG contiennent "CHEZ: CMCIFRPP" (BIC CIC sans
+    # suffixe de branche XXX) dans certains virements vers des bénéficiaires dont le compte
+    # est tenu au CIC. Cette forme courte matchait \bCMCIFRPP\b et déclenchait la détection
+    # CIC par erreur → mauvais parser appliqué → écart vs relevé non nul.
+    # Les marqueurs SG ci-dessous sont exclusifs aux en-têtes SG et n'apparaissent jamais
+    # dans un vrai relevé CIC, donc ce déplacement ne crée aucune régression.
+    # pdfplumber fusionne les mots → "SociétéGénérale" ou "SOCIETEGENERALE"
+    if ("SOCIETE GENERALE" in t or "SOCIÉTÉ GÉNÉRALE" in t
+            or "SOCIETEGENERALE" in t or "SOCIÉTÉGÉNÉRALE" in t
+            or "SOCGEN.COM" in t or "SOCGEN" in t
+            or ("CTC INDEXE TAUX BASE SG" in t)
+            or ("PROFESSIONNELS.SG.FR" in t)):
+        return "SOCIETE_GENERALE"
     # CIC détecté AVANT QONTO : les relevés CIC peuvent contenir "QONTO"
     # comme libellé marchand (ex: "PAIEMENT CB … QONTO CARTE 7647") et
     # déclenchaient un faux positif → parser Qonto appliqué → débit = 0.
     # \bCMCIFRPP\b (frontière de mot) évite de matcher CMCIFRPPXXX (BIC avec
-    # suffixe de branche XXX) qui peut apparaître dans des relevés tiers.
+    # suffixe de branche XXX). Désormais sans risque de faux positif SG car SG
+    # est testé en premier (voir bloc ci-dessus).
     if re.search(r"CREDIT\s+INDUSTRIEL\s+ET\s+COMMERCIAL|\bCMCIFRPP\b", t):
         return "CIC"
     if "QONTO" in t:
@@ -191,20 +212,6 @@ def detect_bank(text: str) -> str:
         return "BNP_PARIBAS"
     if "CREDIT AGRICOLE" in t or "CRÉDIT AGRICOLE" in t:
         return "CREDIT_AGRICOLE"
-    # SHINE détecté AVANT Société Générale : les relevés Shine contiennent fréquemment
-    # "LA SOCIETE GENERALE" comme libellé marchand (paiements carte vers SG),
-    # ce qui déclenchait un faux positif SG. Les marqueurs Shine ci-dessous
-    # (BIC SNNNFR, domaine shine.fr, raison sociale Shine France) sont
-    # exclusifs aux en-têtes/pieds Shine et n'apparaissent jamais dans un vrai relevé SG.
-    if "SHINE" in t and ("SHINE.FR" in t or "SHINE FRANCE" in t or "SNNNFR" in t):
-        return "SHINE"
-    # SG : pdfplumber fusionne les mots → "SociétéGénérale" ou "SOCIETEGENERALE"
-    if ("SOCIETE GENERALE" in t or "SOCIÉTÉ GÉNÉRALE" in t
-            or "SOCIETEGENERALE" in t or "SOCIÉTÉGÉNÉRALE" in t
-            or "SOCGEN.COM" in t or "SOCGEN" in t
-            or ("CTC INDEXE TAUX BASE SG" in t)
-            or ("PROFESSIONNELS.SG.FR" in t)):
-        return "SOCIETE_GENERALE"
     if re.search(r"CREDIT\s*MUTUEL|CRÉDIT\s*MUTUEL", t):
         return "CREDIT_MUTUEL"
     if re.search(r"\bCIC\b", t) and ("BANQUE" in t or "INDUSTRIEL" in t or "RELEVE" in t or "RELEVÉ" in t):
