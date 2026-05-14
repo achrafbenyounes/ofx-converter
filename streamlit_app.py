@@ -1849,6 +1849,11 @@ def parse_credit_agricole_text(text: str, year: str | None = None) -> pd.DataFra
             break
 
     # ── 3. Lignes à ignorer ──
+    # IMPORTANT : ce filtre est appliqué UNIQUEMENT aux lignes qui ne démarrent
+    # PAS avec un pattern de transaction (DD.MM DD.MM …).  Les lignes de
+    # transaction peuvent légitimement contenir des noms de ville (ex :
+    # "Carte X7740 Relais Compiegne 08/01 10,01") et ne doivent jamais être
+    # supprimées par le filtre. Voir logique dans la boucle principale ci-dessous.
     _SKIP = re.compile(
         r"RELEVE\s+DE\s+COMPTES?"
         r"|Date\s+d['']arr[êe]"
@@ -1870,6 +1875,7 @@ def parse_credit_agricole_text(text: str, year: str | None = None) -> pd.DataFra
         r"|Garantie\s+des\s+D[eé]p"
         r"|500\s+Rue\s+Saint"
         r"|RCS\s+AMIENS"
+        r"|RCS\s+CHARTRES"
         r"|Tél\s*:"
         r"|Fax\s*:"
         r"|SOS\s+(?:Cartes|Chèques|Virements)"
@@ -1879,13 +1885,15 @@ def parse_credit_agricole_text(text: str, year: str | None = None) -> pd.DataFra
         r"|www\."
         r"|^S\.?[Aa]\.?[Ss]\."
         r"|Rue\s+[A-Z]"
-        r"|COMPIEGNE|AMIENS|CEDEX"
         r"|^\d{9,}\s*$"
         r"|^\d{4,8}\s*$"              # numéros de marge CA (ex : 011833, 0001, 033062…)
         r"|VAL\s+DE\s+FRANCE"         # sous-titre banque sur sa propre ligne
         r"|^op[eé]\.\s*valeur\s*$"    # en-tête colonne résiduel après saut de page
         r"|Date\s+valeur"             # variante de l'en-tête colonne
-        r"|Appel\s+non\s+surtax",
+        r"|Appel\s+non\s+surtax"
+        # Lignes de pied de page / adresse banque seules (sans date de transaction)
+        r"|CEDEX\s+\d"                # ex : "80095 AMIENS CEDEX 3"
+        r"|^\d+\s+(?:AMIENS|COMPIEGNE|CHARTRES|VENDOME|CHARTRES)\b",
         re.IGNORECASE,
     )
 
@@ -2043,17 +2051,21 @@ def parse_credit_agricole_text(text: str, year: str | None = None) -> pd.DataFra
         return {"date": date_str, "libelle": desc, "montant": round(montant, 2)}
 
     for line in lines:
-        if not line or _SKIP.search(line):
+        if not line:
             continue
 
-        # ── Quirk pdfplumber CA : le symbole ¨ de la ligne précédente et la date
-        # de la transaction suivante sont parfois collés sur la même ligne :
-        #   "¨ 23.03 23.03 Remise Carte 1111132 003 087698 23/03 172,30"
-        # → on nettoie le préfixe ¨/□ avant de tester _TX_START, puis on utilise
-        #   la ligne nettoyée comme première ligne du nouveau bloc.
+        # Nettoyer le préfixe ¨/□ avant de tester _TX_START (quirk pdfplumber CA :
+        # "¨ 23.03 23.03 Remise Carte …" sur une seule ligne).
         line_clean = re.sub(r'^[¨□]+\s*', '', line)
-
         m_tx = _TX_START.match(line_clean)
+
+        # ── RÈGLE CRITIQUE : _SKIP ne s'applique JAMAIS aux lignes de transaction.
+        # Les descriptions de marchands peuvent contenir des noms de ville
+        # (ex : "Carte X7740 Relais Compiegne 08/01 10,01"). Seules les lignes
+        # sans pattern DD.MM DD.MM sont filtrées (en-têtes, pieds de page…).
+        if not m_tx and _SKIP.search(line):
+            continue
+
         if m_tx:
             # Flush bloc précédent
             if block and block_date:
@@ -2063,7 +2075,10 @@ def parse_credit_agricole_text(text: str, year: str | None = None) -> pd.DataFra
             block_date = m_tx.group(1)   # DD.MM
             block = [line_clean]         # bloc sans le préfixe ¨ parasite
         elif block_date:
-            # Ligne de continuation (description multi-lignes)
+            # Ligne de continuation (description multi-lignes) : on filtre
+            # uniquement les lignes de bas-de-page évidents.
+            if _SKIP.search(line):
+                continue
             block.append(line)
 
     # Flush du dernier bloc
