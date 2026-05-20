@@ -2325,6 +2325,13 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
         3. INT DEBITEURS : CRÉDIT ou DÉBIT selon les sous-montants.
            Si les lignes de détail contiennent des montants négatifs ("-0,44" ...)
            c'est un avoir -> CRÉDIT. Sinon (montants positifs, ex "0,27") -> DÉBIT.
+
+        4. AVANTAGE COMMERCIAL : toujours CRÉDIT (remise commerciale SG sur cotisation).
+           Ce bloc décrit une ristourne sur l'abonnement Jazz Pro : la ligne de détail
+           contient "COTISATION MENSUELLE JAZZ PRO" (description de ce sur quoi porte
+           la remise), ce qui déclenche COTIS dans _DEBIT_RE → ambiguïté → -1 par défaut.
+           Or le flux bancaire est bien un crédit (+). Court-circuit obligatoire.
+           Ex : "AVANTAGE COMMERCIAL / COTISATION MENSUELLE JAZZ PRO / -25% LA PREMIERE ANNEE"
         """
         # ── Règle 1 : REMISE CHEQUE -> toujours crédit ──────────────────────────
         if re.search(r"REMISE\s*CH[EÈ]QUE", full_text, re.IGNORECASE):
@@ -2339,6 +2346,13 @@ def parse_societe_generale_text(text: str, year: str | None = None) -> pd.DataFr
             if re.search(r"-\s*\d+[,\.]\d{2}", full_text):
                 return 1   # montants négatifs dans les détails -> remboursement -> crédit
             return -1      # montants positifs -> frais réels -> débit
+
+        # ── Règle 4 : AVANTAGE COMMERCIAL -> toujours crédit ────────────────────
+        # Remise SG sur cotisation (ex: Jazz Pro -25%) : la description du bloc mentionne
+        # "COTISATION MENSUELLE JAZZ PRO" → COTIS dans _DEBIT_RE crée une fausse ambiguïté.
+        # pdfplumber peut fusionner → "AVANTAGECOMMERCIAL" (sans espace, \s* couvre les deux).
+        if re.search(r"AVANTAGE\s*COMMERCIAL", full_text, re.IGNORECASE):
+            return 1
 
         is_credit = bool(_CREDIT_RE.search(full_text))
         is_debit  = bool(_DEBIT_RE.search(full_text))
