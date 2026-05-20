@@ -394,22 +394,6 @@ _CLOSING_PATTERNS = [
 
 
 def extract_opening_balance(text: str) -> float | None:
-    # ── Solde DÉBITEUR d'ouverture (ex : CIC, BNP) → montant négatif ──────────
-    # "SOLDE DEBITEUR AU 31/03/2026 2.026,94" (CIC à découvert)
-    # Re.search trouve le PREMIER match = solde d'ouverture. Correct car le
-    # solde de clôture apparaît en fin de relevé (après toutes les transactions).
-    # Doit être vérifié EN PREMIER car le pattern générique ligne 346 des
-    # _OPENING_PATTERNS matche aussi "d[ée]biteur" mais renvoie la valeur positive.
-    for _deb_pat in [
-        r"Solded[ée]biteurau\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,           # compact pdfplumber
-        r"[Ss]olde\s+d[ée]biteur\s+au\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,  # espacé (CIC/BNP)
-    ]:
-        m_deb = re.search(_deb_pat, text, re.IGNORECASE | re.MULTILINE)
-        if m_deb:
-            val = clean_amount(m_deb.group(1))
-            if val is not None:
-                return -abs(val)  # solde débiteur = solde négatif
-
     for pattern in _OPENING_PATTERNS:
         m = re.search(pattern, text, re.IGNORECASE | re.MULTILINE)
         if m:
@@ -428,23 +412,21 @@ def extract_opening_balance(text: str) -> float | None:
 
 
 def extract_closing_balance(text: str) -> float | None:
-    # ── Solde DÉBITEUR de clôture (ex : CIC, BNP) → montant négatif ───────────
-    # BUG FIX : re.search trouvait le PREMIER "SOLDE DEBITEUR AU …" (= solde
-    # d'ouverture pour les relevés CIC à découvert) au lieu du DERNIER (clôture).
-    # Exemple CIC : texte contient DEUX occurrences :
-    #   "SOLDE DEBITEUR AU 31/03/2026 2.026,94"  ← ouverture (page 1)
-    #   "SOLDE DEBITEUR AU 30/04/2026 1.219,92"  ← clôture   (page 11)
-    # re.findall + [-1] prend toujours le dernier = solde de clôture.
-    # Pour BNP (compact, occurrence unique) findall[-1] donne le seul résultat.
-    # pdfplumber compacte la ligne finale BNP en :
+    # ── BNP Paribas : solde débiteur (compte en déficit) ──────────────────────
+    # pdfplumber compacte la ligne finale de page 9 en :
     #   "Soldedébiteurau28.02.2026 1175,85"  (pas d'espaces, pas de signe)
+    # La valeur est POSITIVE dans le PDF mais représente un SOLDE NÉGATIF.
+    # Ce pattern doit être vérifié EN PREMIER pour éviter que les patterns
+    # génériques ne remontent le solde d'OUVERTURE à la place (voir bug :
+    # "Solde au 28 FÉVRIER :\n+ 7 731,37" matchait avant "- 1 175,85").
+    # Deux variantes : compact pdfplumber ET version espacée (robustesse).
     for _deb_pat in [
-        r"Solded[ée]biteurau\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,           # compact pdfplumber (BNP)
-        r"[Ss]olde\s+d[ée]biteur\s+au\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,  # espacé (CIC)
+        r"Solded[ée]biteurau\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,           # compact pdfplumber
+        r"[Ss]olde\s+d[ée]biteur\s+au\s+\d{2}[\.\/]\d{2}[\.\/]\d{4}\s*" + _AMT,  # espacé
     ]:
-        matches = re.findall(_deb_pat, text, re.IGNORECASE | re.MULTILINE)
-        if matches:
-            val = clean_amount(matches[-1])   # DERNIER match = solde de clôture
+        m_deb = re.search(_deb_pat, text, re.IGNORECASE | re.MULTILINE)
+        if m_deb:
+            val = clean_amount(m_deb.group(1))
             if val is not None:
                 return -abs(val)  # solde débiteur = solde négatif
 
