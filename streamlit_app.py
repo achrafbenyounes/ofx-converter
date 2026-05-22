@@ -931,8 +931,17 @@ def parse_finom_text(text: str, year: str | None = None) -> pd.DataFrame:
     #
     # Lookbehind : (?:^|(?<=[\s€])) garantit que le "-" éventuel est isolé.
     # Le groupe 1 est OPTIONNEL : présent → débit, absent → crédit.
+    #
+    # ⚠ IMPORTANT — séparateur de milliers strict :
+    #   Ancien pattern : \d[\d\xa0\s]*[,\.]\d{2}
+    #   → Trop gourmand : pour "CDISCOUNT 4361335 100,69 €", le moteur avale
+    #     "4361335 100" comme partie entière → montant = 4 361 335 100,69 € (faux !)
+    #   Nouveau pattern : \d{1,3}(?:[\s\xa0]\d{3})*[,\.]\d{2}
+    #   → La partie entière est : 1-3 chiffres + groupes optionnels de (espace+3 chiffres)
+    #     Valide : "100,69"  "1 129,19"  "1 118,23"  "1 034,67"
+    #     Invalide : "4361335 100,69"  (4 millions+ impossible pour ce type de relevé)
     _AMT_EUR = re.compile(
-        r"(?:^|(?<=[\s€]))(-\s*)?(\d[\d\xa0\s]*[,\.]\d{2})\s*€",
+        r"(?:^|(?<=[\s€]))(-\s*)?(\d{1,3}(?:[\s\xa0]\d{3})*[,\.]\d{2})\s*€",
         re.MULTILINE,
     )
 
@@ -1012,9 +1021,11 @@ def parse_finom_text(text: str, year: str | None = None) -> pd.DataFrame:
         if len(amounts) < 2:
             # Fallback : une seule ligne simple comme "30/01/2026 APRR - 1,80 € 390,67 €"
             # Le "-" peut être collé différemment selon le PDF → réessayer en mode permissif
+            # ⚠ Même contrainte de séparateur de milliers strict que _AMT_EUR pour éviter
+            #   de capter des numéros de référence (ex: "4361335 100,69 €").
             amounts_fallback = []
             for m_fb in re.finditer(
-                r"(-\s*)?((?:\d[\d\xa0\s]*)?[,\.]\d{2}|\d+[,\.]\d{2})\s*€",
+                r"(-\s*)?(\d{1,3}(?:[\s\xa0]\d{3})*[,\.]\d{2})\s*€",
                 full_block,
             ):
                 s = (m_fb.group(1) or "").strip()
